@@ -1,0 +1,48 @@
+# hl-agent configuration example
+# Copy this file to config.toml and customize for your deployment
+
+[node]
+# Unique identifier for this agent instance
+node_id = "hl-agent-1"
+
+# Path to Hyperliquid node data directory
+# Supports tilde (~) expansion
+data_dir = "~/hyperliquid/data"
+
+[watcher]
+# Paths to watch for new files (relative to data_dir or absolute)
+# These correspond to Hyperliquid's L1 data output directories
+watch_paths = [
+    "periodic_abci_states/hourly",     # Block data
+    "replica_cmds/hourly",              # Transaction data
+    "node_trades/hourly",               # Trade data
+    "node_fills_by_block/hourly",      # Fill data (batch format)
+    "node_order_statuses/hourly",      # Fill data (single-record format)
+    "node_raw_book_diffs/hourly",      # Order book data
+    "misc_events/hourly"               # Miscellaneous events
+]
+
+# Polling interval in milliseconds (default: 100)
+poll_interval_ms = 100
+
+[sorter]
+# Choose ONE of the following output modes:
+
+# Option 1: gRPC mode - Send data to sorter server
+# endpoint = "http://sorter-host:50051"
+
+# Option 2: File output mode - Write JSON files locally (for deployment without sorter)
+output_dir = "/var/lib/hl-agent/output"
+
+# Batch size for sending records (default: 100)
+batch_size = 100
+
+[checkpoint]
+# Path to SQLite checkpoint database
+# Tracks file offsets for crash recovery
+# Supports tilde (~) expansion
+db_path = "~/.hl-agent/checkpoint.db"
+
+# Update frequency (records between checkpoints)
+# Default: 1000
+# update_interval_records = 1000

@@ -1,0 +1,49 @@
+# Rust
+target/
+Cargo.lock
+**/*.rs.bk
+*.pdb
+
+# Build artifacts
+/build/
+/dist/
+
+# Application data
+*.db
+*.db-shm
+*.db-wal
+checkpoint.db*
+
+# Configuration files (may contain sensitive info)
+config.toml
+*.toml.local
+
+# Output directories
+/output/
+/data/
+
+# Logs
+*.log
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.DS_Store
+
+# Editor backups
+\#*\#
+.\#*
+
+# Testing
+/tmp/
+*.tmp
+
+# Generated files
+/proto/generated/
+
+node_*
+data*
+test_data

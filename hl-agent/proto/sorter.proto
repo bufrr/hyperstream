@@ -1,0 +1,43 @@
+syntax = "proto3";
+
+package hyperstream;
+
+// Import Empty for simple response
+import "google/protobuf/empty.proto";
+
+// Sorter gRPC service - simplified unidirectional streaming
+service SorterService {
+  // Client streaming: agent sends batches, sorter accepts without acknowledgment
+  // This is fire-and-forget for maximum simplicity and throughput
+  rpc StreamData(stream DataBatch) returns (google.protobuf.Empty);
+}
+
+// Batch of records from agent to sorter
+message DataBatch {
+  SourceMetadata source = 1;
+  repeated DataRecord records = 2;
+  // No sequence_id needed - no acks to correlate
+}
+
+// Metadata about data source
+message SourceMetadata {
+  string node_id = 1;       // Which Hyperliquid node (e.g., "node-1")
+  string agent_id = 2;      // Which agent instance (UUID, regenerated on restart)
+  string file_path = 3;     // Source file path (for debugging/monitoring)
+  uint64 byte_offset = 4;   // Current offset in file (for monitoring)
+}
+
+// Individual data record
+message DataRecord {
+  // Deduplication/ordering keys
+  optional uint64 block_height = 1;  // For ordering across nodes
+  optional string tx_hash = 2;       // For deduplication
+  uint64 timestamp = 3;              // Unix milliseconds
+
+  // Kafka routing (sorter will use these)
+  string topic = 4;            // e.g., "hl.blocks", "hl.trades"
+  string partition_key = 5;    // e.g., height, coin, user
+
+  // Actual payload (JSON or msgpack bytes)
+  bytes payload = 6;
+}
