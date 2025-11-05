@@ -33,13 +33,16 @@ pub fn route_parser(file_path: &Path) -> Result<Box<dyn Parser>> {
     }
     if path_contains(file_path, "node_order_statuses")
         || path_contains(file_path, "node_fills_by_block")
+        || path_contains(file_path, "node_order_statuses_by_block")
     {
         return Ok(Box::new(FillsParser::default()));
     }
-    if path_contains(file_path, "node_raw_book_diffs") {
+    if path_contains(file_path, "node_raw_book_diffs")
+        || path_contains(file_path, "node_raw_book_diffs_by_block")
+    {
         return Ok(Box::new(OrdersParser::default()));
     }
-    if path_contains(file_path, "misc_events") {
+    if path_contains(file_path, "misc_events") || path_contains(file_path, "misc_events_by_block") {
         return Ok(Box::new(MiscEventsParser::default()));
     }
 
