@@ -7,19 +7,21 @@ node_id = "hl-agent-1"
 
 # Path to Hyperliquid node data directory
 # Supports tilde (~) expansion
-data_dir = "~/hyperliquid/data"
+data_dir = "~/hl-data"
 
 [watcher]
 # Paths to watch for new files (relative to data_dir or absolute)
 # These correspond to Hyperliquid's L1 data output directories
+# NOTE: The watcher uses recursive mode, so specifying parent directories
+#       will automatically detect files in all subdirectories (e.g., date-based dirs)
 watch_paths = [
-    "periodic_abci_states/hourly",     # Block data
-    "replica_cmds/hourly",              # Transaction data
-    "node_trades/hourly",               # Trade data
-    "node_fills_by_block/hourly",      # Fill data (batch format)
-    "node_order_statuses/hourly",      # Fill data (single-record format)
-    "node_raw_book_diffs/hourly",      # Order book data
-    "misc_events/hourly"               # Miscellaneous events
+    "periodic_abci_states",            # Block data (watches all subdirs like 20251107/)
+    "replica_cmds",                    # Transaction data (watches timestamp dirs like 2025-11-07T*/)
+    "node_trades",                     # Trade data
+    "node_fills_by_block",            # Fill data (batch format)
+    "node_order_statuses",            # Fill data (single-record format)
+    "node_raw_book_diffs",            # Order book data
+    "misc_events"                     # Miscellaneous events
 ]
 
 # Polling interval in milliseconds (default: 100)

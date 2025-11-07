@@ -1,4 +1,4 @@
-use crate::parsers::Parser;
+use crate::parsers::{parse_iso8601_to_millis, Parser};
 use crate::sorter_client::proto::DataRecord;
 use anyhow::{Context, Result};
 use rmp_serde::decode::Error as RmpError;
@@ -12,8 +12,9 @@ pub struct BlocksParser {
     buffer: Vec<u8>,
 }
 
+// Output schema for downstream
 #[derive(Serialize)]
-struct AlliumBlock {
+struct Block {
     height: u64,
     #[serde(rename = "blockTime")]
     block_time: u64,
@@ -23,18 +24,26 @@ struct AlliumBlock {
     num_txs: u32,
 }
 
-#[derive(Deserialize, Default)]
+// Real Hyperliquid node data structure
+#[derive(Deserialize)]
 struct NodeBlock {
-    #[serde(default)]
+    exchange: ExchangeState,
+}
+
+#[derive(Deserialize)]
+struct ExchangeState {
+    context: ExchangeContext,
+}
+
+#[derive(Deserialize)]
+struct ExchangeContext {
     height: u64,
-    #[serde(default, alias = "blockTime", alias = "block_time")]
-    block_time: u64,
+    time: String, // ISO 8601
     #[serde(default)]
-    hash: String,
-    #[serde(default)]
-    proposer: String,
-    #[serde(default, alias = "numTxs", alias = "num_txs")]
-    num_txs: u32,
+    tx_index: u32,
+    // Ignore all other fields (hardfork, next_oid, perp_dexs, etc.)
+    #[serde(flatten)]
+    _extra: serde_json::Value,
 }
 
 impl Parser for BlocksParser {
@@ -60,31 +69,36 @@ impl Parser for BlocksParser {
                         break;
                     }
 
-                    let allium_block = AlliumBlock {
-                        height: node_block.height,
-                        block_time: node_block.block_time,
-                        hash: node_block.hash,
-                        proposer: node_block.proposer,
-                        num_txs: node_block.num_txs,
+                    let ctx = &node_block.exchange.context;
+
+                    // Parse ISO 8601 time to milliseconds
+                    let block_time = parse_iso8601_to_millis(&ctx.time).unwrap_or(0);
+
+                    let block = Block {
+                        height: ctx.height,
+                        block_time,
+                        hash: String::new(), // Not in source data
+                        proposer: String::new(), // Not in source data
+                        num_txs: ctx.tx_index,
                     };
 
-                    let payload = serde_json::to_vec(&allium_block)
+                    let payload = serde_json::to_vec(&block)
                         .context("failed to encode block payload as JSON")?;
 
-                    let partition_key = if allium_block.height == 0 {
+                    let partition_key = if block.height == 0 {
                         "unknown".to_string()
                     } else {
-                        allium_block.height.to_string()
+                        block.height.to_string()
                     };
 
                     records.push(DataRecord {
-                        block_height: if allium_block.height == 0 {
+                        block_height: if block.height == 0 {
                             None
                         } else {
-                            Some(allium_block.height)
+                            Some(block.height)
                         },
                         tx_hash: None,
-                        timestamp: allium_block.block_time,
+                        timestamp: block.block_time,
                         topic: "hl.blocks".to_string(),
                         partition_key,
                         payload,

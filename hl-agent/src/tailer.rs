@@ -3,6 +3,7 @@ use crate::output_writer::RecordSink;
 use crate::parsers;
 use crate::sorter_client::proto::DataRecord;
 use anyhow::{Context, Result};
+use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -13,6 +14,7 @@ use tracing::{debug, info, warn};
 
 const DEFAULT_POLL_INTERVAL_MS: u64 = 100;
 const MAX_PARSE_RETRIES: u32 = 3;
+const MAX_READ_CHUNK_BYTES: usize = 8 * 1024 * 1024; // 8 MiB per iteration
 
 pub async fn tail_file(
     file_path: PathBuf,
@@ -73,7 +75,14 @@ pub async fn tail_file(
 
         if file_size > read_offset {
             let chunk_start = read_offset;
-            match read_new_bytes(&file_path, chunk_start).await {
+            let bytes_available = file_size.saturating_sub(chunk_start);
+            let bytes_to_read = bytes_available.min(MAX_READ_CHUNK_BYTES as u64) as usize;
+            if bytes_to_read == 0 {
+                sleep(sleep_interval).await;
+                continue;
+            }
+
+            match read_new_bytes(&file_path, chunk_start, bytes_to_read).await {
                 Ok(buffer) => {
                     if buffer.is_empty() {
                         sleep(sleep_interval).await;
@@ -142,6 +151,29 @@ pub async fn tail_file(
 
                     let had_records = !records.is_empty();
                     if had_records {
+                        let total_records = records.len();
+                        let mut topic_counts: HashMap<String, usize> = HashMap::new();
+                        for record in &records {
+                            *topic_counts.entry(record.topic.clone()).or_default() += 1;
+                        }
+                        let planned_batches = if batch_size == 0 || total_records == 0 {
+                            1
+                        } else {
+                            (total_records + batch_size - 1) / batch_size
+                        };
+
+                        for (topic, count) in topic_counts {
+                            debug!(
+                                path = %file_path.display(),
+                                %topic,
+                                record_count = count,
+                                total_records,
+                                batch_size,
+                                planned_batches,
+                                "parser produced records; handing off to sink"
+                            );
+                        }
+
                         let batches: Vec<Vec<DataRecord>> = if batch_size == 0 {
                             vec![records]
                         } else {
@@ -189,17 +221,30 @@ pub async fn tail_file(
     }
 }
 
-async fn read_new_bytes(path: &PathBuf, offset: u64) -> Result<Vec<u8>> {
+async fn read_new_bytes(path: &PathBuf, offset: u64, max_bytes: usize) -> Result<Vec<u8>> {
     let mut file = fs::File::open(path)
         .await
         .with_context(|| format!("failed to open {}", path.display()))?;
     file.seek(tokio::io::SeekFrom::Start(offset))
         .await
         .with_context(|| format!("failed to seek {} to offset {}", path.display(), offset))?;
-    let mut buffer = Vec::new();
-    file.read_to_end(&mut buffer)
-        .await
-        .with_context(|| format!("failed to read from {}", path.display()))?;
+    if max_bytes == 0 {
+        return Ok(Vec::new());
+    }
+
+    let mut buffer = vec![0u8; max_bytes];
+    let mut total_read = 0usize;
+    while total_read < max_bytes {
+        let bytes_read = file
+            .read(&mut buffer[total_read..])
+            .await
+            .with_context(|| format!("failed to read from {}", path.display()))?;
+        if bytes_read == 0 {
+            break;
+        }
+        total_read += bytes_read;
+    }
+    buffer.truncate(total_read);
     Ok(buffer)
 }
 

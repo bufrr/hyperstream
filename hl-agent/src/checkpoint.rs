@@ -34,9 +34,9 @@ impl CheckpointDB {
         let conn = Connection::open(path)
             .with_context(|| format!("failed to open checkpoint db {}", path.display()))?;
 
-        conn.pragma_update(None, "journal_mode", &"WAL")
+        conn.pragma_update(None, "journal_mode", "WAL")
             .context("failed to enable WAL mode for checkpoint db")?;
-        conn.pragma_update(None, "synchronous", &"NORMAL")
+        conn.pragma_update(None, "synchronous", "NORMAL")
             .context("failed to set checkpoint db synchronous mode")?;
 
         conn.execute_batch(

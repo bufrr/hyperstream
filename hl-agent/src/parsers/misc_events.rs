@@ -1,13 +1,12 @@
-use crate::parsers::{
-    deserialize_option_u64_from_any, deserialize_string_or_number, deserialize_u64_from_any,
-    drain_complete_lines, trim_line_bytes, Parser,
-};
+use crate::parsers::{drain_complete_lines, parse_iso8601_to_millis, trim_line_bytes, Parser};
 use crate::sorter_client::proto::DataRecord;
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
-use serde_json::Value;
+use serde_json::{self, Map, Value};
 use std::path::Path;
 use tracing::warn;
+
+const LINE_PREVIEW_LIMIT: usize = 256;
 
 #[derive(Default)]
 pub struct MiscEventsParser {
@@ -15,51 +14,26 @@ pub struct MiscEventsParser {
 }
 
 #[derive(Serialize)]
-struct AlliumMiscEvent {
-    #[serde(rename = "eventType")]
-    event_type: String,
-    user: String,
-    time: u64,
-    data: Value,
+struct MiscEvent {
+    time: String,
+    hash: String,
+    inner: Value,
 }
 
-#[derive(Deserialize, Default)]
-struct NodeMiscEvent {
-    #[serde(default, alias = "eventType", alias = "event_type")]
-    event_type: String,
-    #[serde(
-        default,
-        alias = "userAddress",
-        alias = "address",
-        deserialize_with = "deserialize_string_or_number"
-    )]
-    user: String,
-    #[serde(
-        default,
-        alias = "time",
-        alias = "timestamp",
-        alias = "eventTime",
-        deserialize_with = "deserialize_u64_from_any"
-    )]
-    time: u64,
-    #[serde(default)]
-    data: Value,
-    #[serde(
-        default,
-        alias = "height",
-        alias = "block",
-        alias = "blockHeight",
-        deserialize_with = "deserialize_option_u64_from_any"
-    )]
-    block_height: Option<u64>,
-    #[serde(
-        default,
-        alias = "hash",
-        alias = "txHash",
-        alias = "tx_hash",
-        deserialize_with = "deserialize_string_or_number"
-    )]
+#[derive(Deserialize)]
+struct NodeMiscEventBatch {
+    #[serde(alias = "blockNumber", alias = "block_number", alias = "block_height")]
+    block_number: u64,
+    #[serde(default, deserialize_with = "deserialize_misc_events")]
+    events: Vec<RawMiscEvent>,
+}
+
+#[derive(Deserialize)]
+struct RawMiscEvent {
+    time: String,
     hash: String,
+    #[serde(flatten)]
+    payload: Map<String, Value>,
 }
 
 impl Parser for MiscEventsParser {
@@ -68,48 +42,25 @@ impl Parser for MiscEventsParser {
         let lines = drain_complete_lines(&mut self.buffer);
         let mut records = Vec::with_capacity(lines.len());
 
-        for raw_line in lines {
+        for (line_idx, raw_line) in lines.into_iter().enumerate() {
             let line = trim_line_bytes(raw_line);
             if line.is_empty() {
                 continue;
             }
 
-            match serde_json::from_slice::<NodeMiscEvent>(&line) {
-                Ok(node_event) => {
-                    let block_height = node_event.block_height;
-                    let tx_hash = if node_event.hash.is_empty() {
-                        None
-                    } else {
-                        Some(node_event.hash.clone())
-                    };
-
-                    let allium_event = AlliumMiscEvent {
-                        event_type: node_event.event_type,
-                        user: node_event.user,
-                        time: node_event.time,
-                        data: node_event.data,
-                    };
-
-                    let partition_key = if allium_event.event_type.is_empty() {
-                        "unknown".to_string()
-                    } else {
-                        allium_event.event_type.clone()
-                    };
-
-                    let payload = serde_json::to_vec(&allium_event)
-                        .context("failed to encode misc event payload to JSON")?;
-
-                    records.push(DataRecord {
-                        block_height,
-                        tx_hash,
-                        timestamp: allium_event.time,
-                        topic: "hl.misc_events".to_string(),
-                        partition_key,
-                        payload,
-                    });
+            match serde_json::from_slice::<NodeMiscEventBatch>(&line) {
+                Ok(batch) => {
+                    for event in batch.events {
+                        records.push(node_misc_event_to_record(event, Some(batch.block_number))?);
+                    }
                 }
                 Err(err) => {
-                    warn!(error = %err, "failed to parse misc event line as JSON");
+                    warn!(
+                        error = %err,
+                        line_idx,
+                        preview = %line_preview(&line),
+                        "skipping unrecognized misc event line format"
+                    );
                 }
             }
         }
@@ -120,4 +71,131 @@ impl Parser for MiscEventsParser {
     fn backlog_len(&self) -> usize {
         self.buffer.len()
     }
+}
+
+fn node_misc_event_to_record(
+    event: RawMiscEvent,
+    block_height: Option<u64>,
+) -> Result<DataRecord> {
+    let user = extract_user_from_payload(&event.payload);
+
+    let event = MiscEvent {
+        time: event.time.clone(),
+        hash: event.hash.clone(),
+        inner: Value::Object(event.payload),
+    };
+
+    let partition_key = if user.is_empty() {
+        "system".to_string()
+    } else {
+        user.clone()
+    };
+
+    let payload =
+        serde_json::to_vec(&event).context("failed to encode misc event payload to JSON")?;
+
+    // Parse timestamp
+    let timestamp = parse_iso8601_to_millis(&event.time).unwrap_or(0);
+
+    Ok(DataRecord {
+        block_height,
+        tx_hash: if event.hash.is_empty() {
+            None
+        } else {
+            Some(event.hash)
+        },
+        timestamp,
+        topic: "hl.misc_events".to_string(),
+        partition_key,
+        payload,
+    })
+}
+
+fn extract_user_from_payload(payload: &Map<String, Value>) -> String {
+    if let Some(user_value) = payload.get("user").and_then(Value::as_str) {
+        return user_value.to_string();
+    }
+
+    if let Some(Value::Object(inner_map)) = payload.get("inner") {
+        for event_data in inner_map.values() {
+            let user = extract_user_from_event(event_data);
+            if !user.is_empty() {
+                return user;
+            }
+        }
+    }
+
+    for value in payload.values() {
+        let user = extract_user_from_event(value);
+        if !user.is_empty() {
+            return user;
+        }
+    }
+
+    String::new()
+}
+
+fn extract_user_from_event(event_data: &Value) -> String {
+    if let Value::Object(map) = event_data {
+        map.get("user")
+            .and_then(Value::as_str)
+            .map(ToString::to_string)
+            .or_else(|| {
+                map.get("users").and_then(|value| {
+                    value
+                        .as_array()
+                        .and_then(|arr| arr.first())
+                        .and_then(Value::as_str)
+                        .map(ToString::to_string)
+                })
+            })
+            .or_else(|| {
+                map.get("delta").and_then(|value| {
+                    value
+                        .as_object()
+                        .and_then(|delta| delta.get("user"))
+                        .and_then(Value::as_str)
+                        .map(ToString::to_string)
+                })
+            })
+            .unwrap_or_default()
+    } else {
+        String::new()
+    }
+}
+
+fn deserialize_misc_events<'de, D>(deserializer: D) -> Result<Vec<RawMiscEvent>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let value = Option::<Value>::deserialize(deserializer)?;
+    match value {
+        None | Some(Value::Null) => Ok(Vec::new()),
+        Some(Value::Array(items)) => items
+            .into_iter()
+            .map(|item| serde_json::from_value(item).map_err(serde::de::Error::custom))
+            .collect(),
+        Some(Value::Object(map)) => map
+            .into_iter()
+            .map(|(_, item)| serde_json::from_value(item).map_err(serde::de::Error::custom))
+            .collect(),
+        Some(other) => Err(serde::de::Error::custom(format!(
+            "expected misc event list or map, got {other:?}"
+        ))),
+    }
+}
+
+fn line_preview(line: &[u8]) -> String {
+    let text = String::from_utf8_lossy(line);
+    let mut preview = String::new();
+    let mut consumed = 0usize;
+    for ch in text.chars() {
+        if consumed >= LINE_PREVIEW_LIMIT {
+            preview.push('…');
+            return preview;
+        }
+        preview.push(ch);
+        consumed += 1;
+    }
+    preview
 }

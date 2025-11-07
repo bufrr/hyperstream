@@ -22,6 +22,8 @@ use tokio::task::JoinHandle;
 use tracing::{error, info, warn};
 use watcher::{watch_directories, FileEvent};
 
+const FORCE_FLUSH_ENV: &str = "HL_AGENT_FORCE_FLUSH";
+
 #[tokio::main]
 async fn main() -> Result<()> {
     init_tracing();
@@ -29,7 +31,8 @@ async fn main() -> Result<()> {
     let config_path =
         std::env::var("HL_AGENT_CONFIG").unwrap_or_else(|_| "config.toml".to_string());
     let config = Config::load(&config_path)
-        .with_context(|| format!("failed to load config from {}", config_path))?;
+        .with_context(|| format!("failed to load config from {config_path}"))?;
+    let batch_size = resolve_batch_size(config.sorter.batch_size);
 
     let watch_paths = config.watch_paths();
     let poll_interval = Duration::from_millis(config.watcher.poll_interval_ms);
@@ -87,7 +90,7 @@ async fn main() -> Result<()> {
         checkpoint_db.clone(),
         record_sink.clone(),
         poll_interval,
-        config.sorter.batch_size,
+        batch_size,
     ) {
         warn!(error = %err, "failed to discover existing files on startup");
     }
@@ -106,7 +109,7 @@ async fn main() -> Result<()> {
                             checkpoint_db.clone(),
                             record_sink.clone(),
                             poll_interval,
-                            config.sorter.batch_size,
+                            batch_size,
                         );
                     }
                     None => {
@@ -136,6 +139,33 @@ async fn main() -> Result<()> {
     watcher_handle.abort();
 
     Ok(())
+}
+
+fn resolve_batch_size(configured: usize) -> usize {
+    match std::env::var(FORCE_FLUSH_ENV) {
+        Ok(value) => {
+            let trimmed = value.trim();
+            if trimmed.eq_ignore_ascii_case("true") || trimmed == "1" {
+                warn!(
+                    env = FORCE_FLUSH_ENV,
+                    configured, "forcing batch size to 1 for immediate flush (testing mode)"
+                );
+                1
+            } else if trimmed.eq_ignore_ascii_case("false") || trimmed == "0" {
+                configured.max(1)
+            } else {
+                warn!(
+                    env = FORCE_FLUSH_ENV,
+                    value = trimmed,
+                    configured,
+                    "unrecognized value for {}; using configured batch size",
+                    FORCE_FLUSH_ENV
+                );
+                configured.max(1)
+            }
+        }
+        Err(_) => configured.max(1),
+    }
 }
 
 fn init_tracing() {

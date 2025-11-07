@@ -47,3 +47,4 @@ config.toml
 node_*
 data*
 test_data
+CLAUDE.md

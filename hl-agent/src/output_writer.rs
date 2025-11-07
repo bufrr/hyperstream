@@ -6,6 +6,7 @@ use serde_json::{self, Value};
 use std::path::PathBuf;
 use tokio::fs;
 use tonic::async_trait;
+use tracing::debug;
 use uuid::Uuid;
 
 #[async_trait]
@@ -111,6 +112,13 @@ impl FileWriter {
                 final_path.display()
             )
         })?;
+
+        debug!(
+            topic = %record.topic,
+            partition_key = %record.partition_key,
+            output = %final_path.display(),
+            "persisted record to local sink"
+        );
 
         Ok(())
     }

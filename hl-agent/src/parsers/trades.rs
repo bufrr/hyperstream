@@ -14,14 +14,14 @@ pub struct TradesParser {
 }
 
 #[derive(Serialize)]
-struct AlliumTrade {
+struct Trade {
     coin: String,
     side: String,
     px: String,
     sz: String,
     time: u64,
     hash: String,
-    tid: String,
+    tid: u64,
     users: Vec<String>,
 }
 
@@ -52,9 +52,9 @@ struct NodeTrade {
         default,
         alias = "tradeId",
         alias = "trade_id",
-        deserialize_with = "deserialize_string_or_number"
+        deserialize_with = "deserialize_u64_from_any"
     )]
-    tid: String,
+    tid: u64,
     #[serde(default)]
     users: Vec<String>,
     #[serde(
@@ -89,7 +89,7 @@ impl Parser for TradesParser {
                         Some(node_trade.hash.clone())
                     };
 
-                    let allium_trade = AlliumTrade {
+                    let trade = Trade {
                         coin: node_trade.coin,
                         side: node_trade.side,
                         px: node_trade.px,
@@ -100,19 +100,19 @@ impl Parser for TradesParser {
                         users: node_trade.users,
                     };
 
-                    let partition_key = if allium_trade.coin.is_empty() {
+                    let partition_key = if trade.coin.is_empty() {
                         "unknown".to_string()
                     } else {
-                        allium_trade.coin.clone()
+                        trade.coin.clone()
                     };
 
-                    let payload = serde_json::to_vec(&allium_trade)
+                    let payload = serde_json::to_vec(&trade)
                         .context("failed to encode trade payload to JSON")?;
 
                     records.push(DataRecord {
                         block_height,
                         tx_hash,
-                        timestamp: allium_trade.time,
+                        timestamp: trade.time,
                         topic: "hl.trades".to_string(),
                         partition_key,
                         payload,

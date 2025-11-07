@@ -15,7 +15,7 @@ pub struct FillsParser {
 }
 
 #[derive(Serialize)]
-struct AlliumFill {
+struct Fill {
     user: String,
     coin: String,
     px: String,
@@ -27,11 +27,14 @@ struct AlliumFill {
     dir: String,
     #[serde(rename = "closedPnl")]
     closed_pnl: String,
+    hash: String,
     oid: u64,
+    crossed: bool,
     fee: String,
+    tid: u64,
     #[serde(rename = "feeToken")]
     fee_token: String,
-    liquidation: Option<String>,
+    liquidation: Option<Value>,
 }
 
 #[derive(Deserialize, Default)]
@@ -78,8 +81,17 @@ struct NodeFill {
         deserialize_with = "deserialize_u64_from_any"
     )]
     oid: u64,
+    #[serde(default, alias = "isCrossed", alias = "is_crossed")]
+    crossed: bool,
     #[serde(default, deserialize_with = "deserialize_string_or_number")]
     fee: String,
+    #[serde(
+        default,
+        alias = "tradeId",
+        alias = "trade_id",
+        deserialize_with = "deserialize_u64_from_any"
+    )]
+    tid: u64,
     #[serde(default, alias = "feeToken", alias = "fee_token")]
     fee_token: String,
     #[serde(default)]
@@ -156,7 +168,7 @@ fn node_fill_to_record(node_fill: NodeFill) -> Result<DataRecord> {
         Some(node_fill.hash.clone())
     };
 
-    let allium_fill = AlliumFill {
+    let fill = Fill {
         user: node_fill.user,
         coin: node_fill.coin,
         px: node_fill.px,
@@ -166,49 +178,36 @@ fn node_fill_to_record(node_fill: NodeFill) -> Result<DataRecord> {
         start_position: node_fill.start_position,
         dir: node_fill.dir,
         closed_pnl: node_fill.closed_pnl,
+        hash: node_fill.hash,
         oid: node_fill.oid,
+        crossed: node_fill.crossed,
         fee: node_fill.fee,
+        tid: node_fill.tid,
         fee_token: node_fill.fee_token,
-        liquidation: liquidation_to_option_string(node_fill.liquidation),
+        liquidation: node_fill.liquidation,
     };
 
-    let user_for_partition = if allium_fill.user.is_empty() {
+    let user_for_partition = if fill.user.is_empty() {
         "unknown".to_string()
     } else {
-        allium_fill.user.clone()
+        fill.user.clone()
     };
-    let coin_for_partition = if allium_fill.coin.is_empty() {
+    let coin_for_partition = if fill.coin.is_empty() {
         "unknown".to_string()
     } else {
-        allium_fill.coin.clone()
+        fill.coin.clone()
     };
     let partition_key = format!("{user_for_partition}-{coin_for_partition}");
 
     let payload =
-        serde_json::to_vec(&allium_fill).context("failed to encode fill payload to JSON")?;
+        serde_json::to_vec(&fill).context("failed to encode fill payload to JSON")?;
 
     Ok(DataRecord {
         block_height,
         tx_hash,
-        timestamp: allium_fill.time,
+        timestamp: fill.time,
         topic: "hl.fills".to_string(),
         partition_key,
         payload,
     })
-}
-
-fn liquidation_to_option_string(value: Option<Value>) -> Option<String> {
-    match value {
-        None | Some(Value::Null) => None,
-        Some(Value::String(s)) => {
-            if s.is_empty() {
-                None
-            } else {
-                Some(s)
-            }
-        }
-        Some(Value::Number(n)) => Some(n.to_string()),
-        Some(Value::Bool(b)) => Some(b.to_string()),
-        Some(other) => Some(other.to_string()),
-    }
 }
