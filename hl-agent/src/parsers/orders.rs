@@ -1,4 +1,4 @@
-use crate::parsers::{drain_complete_lines, trim_line_bytes, Parser};
+use crate::parsers::{drain_complete_lines, line_preview, trim_line_bytes, Parser};
 use crate::sorter_client::proto::DataRecord;
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
@@ -69,7 +69,7 @@ impl Parser for OrdersParser {
                     warn!(
                         error = %err,
                         line_idx,
-                        preview = %line_preview(&line),
+                        preview = %line_preview(&line, LINE_PREVIEW_LIMIT),
                         "skipping unrecognized order book diff line format"
                     );
                 }
@@ -158,20 +158,6 @@ where
     }
 }
 
-fn line_preview(line: &[u8]) -> String {
-    let text = String::from_utf8_lossy(line);
-    let mut preview = String::new();
-    let mut consumed = 0usize;
-    for ch in text.chars() {
-        if consumed >= LINE_PREVIEW_LIMIT {
-            preview.push('…');
-            return preview;
-        }
-        preview.push(ch);
-        consumed += 1;
-    }
-    preview
-}
 
 #[cfg(test)]
 mod tests {

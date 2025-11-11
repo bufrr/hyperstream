@@ -84,6 +84,8 @@ async fn main() -> Result<()> {
 
     let mut active_tailers: HashMap<PathBuf, JoinHandle<()>> = HashMap::new();
 
+    let skip_historical = config.skip_historical();
+
     if let Err(err) = seed_existing_files(
         &watch_paths,
         &mut active_tailers,
@@ -91,7 +93,10 @@ async fn main() -> Result<()> {
         record_sink.clone(),
         poll_interval,
         batch_size,
-    ) {
+        skip_historical,
+    )
+    .await
+    {
         warn!(error = %err, "failed to discover existing files on startup");
     }
 
@@ -185,16 +190,35 @@ fn event_path(event: &FileEvent) -> PathBuf {
     }
 }
 
-fn seed_existing_files(
+async fn seed_existing_files(
     watch_paths: &[PathBuf],
     active_tailers: &mut HashMap<PathBuf, JoinHandle<()>>,
     checkpoint_db: Arc<CheckpointDB>,
     record_sink: Arc<dyn RecordSink>,
     poll_interval: Duration,
     batch_size: usize,
+    skip_historical: bool,
 ) -> Result<()> {
     let existing_files = discover_existing_files(watch_paths)?;
+
+    info!(
+        skip_historical,
+        file_count = existing_files.len(),
+        "seeding existing files"
+    );
+
     for path in existing_files {
+        // If skip_historical is true, set offset to end of file (unless checkpoint already exists)
+        if skip_historical {
+            if let Err(err) = initialize_checkpoint_if_needed(&path, &checkpoint_db).await {
+                warn!(
+                    error = %err,
+                    path = %path.display(),
+                    "failed to initialize checkpoint; will use default behavior"
+                );
+            }
+        }
+
         spawn_tailer_if_needed(
             active_tailers,
             path,
@@ -204,6 +228,44 @@ fn seed_existing_files(
             batch_size,
         );
     }
+    Ok(())
+}
+
+async fn initialize_checkpoint_if_needed(
+    path: &PathBuf,
+    checkpoint_db: &Arc<CheckpointDB>,
+) -> Result<()> {
+    // Check if checkpoint already exists
+    let existing_checkpoint = checkpoint_db.get(path).await?;
+    if existing_checkpoint.is_none() {
+        // No checkpoint exists, set to end of file to skip historical data
+        set_offset_to_end(path, checkpoint_db).await?;
+    }
+    Ok(())
+}
+
+async fn set_offset_to_end(path: &PathBuf, checkpoint_db: &Arc<CheckpointDB>) -> Result<()> {
+    let metadata = tokio::fs::metadata(path).await?;
+    let file_size = metadata.len();
+    let last_modified = metadata
+        .modified()
+        .ok()
+        .and_then(|t| {
+            t.duration_since(std::time::UNIX_EPOCH)
+                .ok()
+                .map(|d| d.as_secs() as i64)
+        })
+        .unwrap_or(0);
+
+    checkpoint_db
+        .set_offset(path, file_size, file_size, last_modified)
+        .await?;
+
+    info!(
+        path = %path.display(),
+        offset = file_size,
+        "initialized checkpoint to end of file (skip historical data)"
+    );
     Ok(())
 }
 

@@ -84,6 +84,33 @@ pub(crate) fn trim_line_bytes(mut line: Vec<u8>) -> Vec<u8> {
     line
 }
 
+/// Creates a preview string from a byte slice, truncating at 256 characters with ellipsis.
+/// Used for logging parsed line content without overwhelming the logs.
+pub(crate) fn line_preview(line: &[u8], limit: usize) -> String {
+    let text = String::from_utf8_lossy(line);
+    let mut preview = String::new();
+    let mut consumed = 0usize;
+    for ch in text.chars() {
+        if consumed >= limit {
+            preview.push('…');
+            return preview;
+        }
+        preview.push(ch);
+        consumed += 1;
+    }
+    preview
+}
+
+/// Returns "unknown" if the input string is empty, otherwise returns the input as-is.
+/// Used for partition keys to ensure valid kafka-style routing even when data is missing.
+pub(crate) fn partition_key_or_unknown(value: &str) -> String {
+    if value.is_empty() {
+        "unknown".to_string()
+    } else {
+        value.to_string()
+    }
+}
+
 pub(crate) fn deserialize_string_or_number<'de, D>(deserializer: D) -> Result<String, D::Error>
 where
     D: serde::Deserializer<'de>,

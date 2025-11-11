@@ -1,6 +1,6 @@
 use crate::parsers::{
     deserialize_option_u64_from_any, deserialize_string_or_number, deserialize_u64_from_any,
-    drain_complete_lines, trim_line_bytes, Parser,
+    drain_complete_lines, partition_key_or_unknown, trim_line_bytes, Parser,
 };
 use crate::sorter_client::proto::DataRecord;
 use anyhow::{Context, Result};
@@ -187,16 +187,8 @@ fn node_fill_to_record(node_fill: NodeFill) -> Result<DataRecord> {
         liquidation: node_fill.liquidation,
     };
 
-    let user_for_partition = if fill.user.is_empty() {
-        "unknown".to_string()
-    } else {
-        fill.user.clone()
-    };
-    let coin_for_partition = if fill.coin.is_empty() {
-        "unknown".to_string()
-    } else {
-        fill.coin.clone()
-    };
+    let user_for_partition = partition_key_or_unknown(&fill.user);
+    let coin_for_partition = partition_key_or_unknown(&fill.coin);
     let partition_key = format!("{user_for_partition}-{coin_for_partition}");
 
     let payload =

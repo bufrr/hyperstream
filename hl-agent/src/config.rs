@@ -22,6 +22,11 @@ pub struct WatcherConfig {
     pub watch_paths: Vec<String>,
     #[serde(default = "default_poll_interval_ms")]
     pub poll_interval_ms: u64,
+    /// Skip historical data and only process new data after startup (DEFAULT: true)
+    /// - true: Start from end of existing files (prevents OOM when many historical files exist)
+    /// - false: Process all data from the beginning (use for backfilling)
+    #[serde(default = "default_skip_historical")]
+    pub skip_historical: bool,
 }
 
 #[derive(Debug, Deserialize, Clone)]
@@ -45,6 +50,7 @@ pub struct CheckpointConfig {
 const DEFAULT_POLL_INTERVAL_MS: u64 = 100;
 const DEFAULT_BATCH_SIZE: usize = 100;
 const DEFAULT_UPDATE_INTERVAL_RECORDS: u64 = 1_000;
+const DEFAULT_SKIP_HISTORICAL: bool = true;
 
 fn default_poll_interval_ms() -> u64 {
     DEFAULT_POLL_INTERVAL_MS
@@ -56,6 +62,10 @@ fn default_batch_size() -> usize {
 
 fn default_update_interval_records() -> u64 {
     DEFAULT_UPDATE_INTERVAL_RECORDS
+}
+
+fn default_skip_historical() -> bool {
+    DEFAULT_SKIP_HISTORICAL
 }
 
 impl Config {
@@ -113,6 +123,10 @@ impl Config {
     pub fn checkpoint_db_path(&self) -> PathBuf {
         let expanded = shellexpand::tilde(&self.checkpoint.db_path);
         PathBuf::from(expanded.as_ref())
+    }
+
+    pub fn skip_historical(&self) -> bool {
+        self.watcher.skip_historical
     }
 }
 

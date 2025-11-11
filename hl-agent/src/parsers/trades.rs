@@ -1,6 +1,6 @@
 use crate::parsers::{
     deserialize_option_u64_from_any, deserialize_string_or_number, deserialize_u64_from_any,
-    drain_complete_lines, trim_line_bytes, Parser,
+    drain_complete_lines, partition_key_or_unknown, trim_line_bytes, Parser,
 };
 use crate::sorter_client::proto::DataRecord;
 use anyhow::{Context, Result};
@@ -100,11 +100,7 @@ impl Parser for TradesParser {
                         users: node_trade.users,
                     };
 
-                    let partition_key = if trade.coin.is_empty() {
-                        "unknown".to_string()
-                    } else {
-                        trade.coin.clone()
-                    };
+                    let partition_key = partition_key_or_unknown(&trade.coin);
 
                     let payload = serde_json::to_vec(&trade)
                         .context("failed to encode trade payload to JSON")?;

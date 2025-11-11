@@ -13,7 +13,6 @@ use tokio::time::sleep;
 use tracing::{debug, info, warn};
 
 const DEFAULT_POLL_INTERVAL_MS: u64 = 100;
-const MAX_PARSE_RETRIES: u32 = 3;
 const MAX_READ_CHUNK_BYTES: usize = 8 * 1024 * 1024; // 8 MiB per iteration
 
 pub async fn tail_file(
@@ -33,9 +32,9 @@ pub async fn tail_file(
 
     info!(path = %file_path.display(), offset = read_offset, "starting tailer");
 
-    let mut parse_failures: u32 = 0;
-
     loop {
+        let loop_start = std::time::Instant::now();
+
         let metadata = match fs::metadata(&file_path).await {
             Ok(meta) => meta,
             Err(err) => {
@@ -65,7 +64,6 @@ pub async fn tail_file(
             );
             read_offset = 0;
             parser = parsers::route_parser(&file_path)?;
-            parse_failures = 0;
             checkpoint_db
                 .set_offset(&file_path, 0, file_size, last_modified_ts)
                 .await?;
@@ -89,53 +87,35 @@ pub async fn tail_file(
                         continue;
                     }
 
+                    let read_complete = std::time::Instant::now();
+                    let read_latency_ms = read_complete.duration_since(loop_start).as_millis();
+
                     let next_read_offset = chunk_start
                         .checked_add(buffer.len() as u64)
                         .unwrap_or(chunk_start);
 
                     let records = match parser.parse(&file_path, &buffer) {
                         Ok(records) => {
-                            parse_failures = 0;
                             read_offset = next_read_offset;
                             records
                         }
                         Err(err) => {
-                            parse_failures = parse_failures.saturating_add(1);
                             warn!(
                                 error = %err,
                                 path = %file_path.display(),
-                                attempt = parse_failures,
-                                "failed to parse new bytes"
+                                chunk_start,
+                                bytes_read = buffer.len(),
+                                "parse failed; continuing without retry (file data may be corrupted)"
                             );
-
-                            let multiplier = parse_failures.max(1);
-                            let backoff = sleep_interval
-                                .checked_mul(multiplier)
-                                .unwrap_or(sleep_interval);
-
-                            if parse_failures >= MAX_PARSE_RETRIES {
-                                warn!(
-                                    path = %file_path.display(),
-                                    "max parse retries exceeded; resetting parser and skipping bytes"
-                                );
-                                parser = parsers::route_parser(&file_path)?;
-                                read_offset = next_read_offset;
-                                let checkpoint_offset = read_offset;
-                                checkpoint_db
-                                    .set_offset(
-                                        &file_path,
-                                        checkpoint_offset,
-                                        file_size,
-                                        last_modified_ts,
-                                    )
-                                    .await?;
-                                parse_failures = 0;
-                            }
-
-                            sleep(backoff).await;
+                            // Move offset forward to avoid infinite loop on same corrupted data
+                            read_offset = next_read_offset;
+                            sleep(sleep_interval).await;
                             continue;
                         }
                     };
+
+                    let parse_complete = std::time::Instant::now();
+                    let parse_latency_ms = parse_complete.duration_since(read_complete).as_millis();
 
                     if let Ok(meta) = fs::metadata(&file_path).await {
                         file_size = meta.len();
@@ -190,10 +170,16 @@ pub async fn tail_file(
                                 .send_batch(file_path_str.clone(), chunk_start, chunk)
                                 .await?;
 
-                            debug!(
-                                "sent batch with {} records from {}",
+                            let send_complete = std::time::Instant::now();
+                            let total_latency_ms = send_complete.duration_since(loop_start).as_millis();
+
+                            info!(
+                                path = %file_path.display(),
                                 record_count,
-                                file_path.display()
+                                read_latency_ms,
+                                parse_latency_ms,
+                                total_latency_ms,
+                                "batch sent - latency breakdown"
                             );
                         }
                     }

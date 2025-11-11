@@ -20,7 +20,7 @@ use serde::Serialize;
 use tokio::signal;
 use tonic::{Request, Response, Status};
 use tonic::transport::Server;
-use tracing::{error, info, warn};
+use tracing::{debug, error, info, warn};
 
 pub mod proto {
     tonic::include_proto!("hyperstream");
@@ -130,7 +130,13 @@ impl SorterService for MockSorter {
                 );
             }
             if report.duplicate_tx > 0 {
-                warn!(duplicates = report.duplicate_tx, "duplicate tx_hash detected");
+                // DEBUG level: duplicates are EXPECTED in Hyperliquid data model
+                // - trades/fills: buyer+seller pairs (2 records per tx)
+                // - transactions: batch operations (100+ records per bundle)
+                debug!(
+                    duplicates = report.duplicate_tx,
+                    "tx_hash duplicates within topics (expected: trades/fills have pairs, transactions have batches)"
+                );
             }
 
             if let Some(writer) = &self.record_writer {
@@ -159,6 +165,8 @@ struct StatsTracker {
     records_by_topic: Mutex<HashMap<String, u64>>,
     unique_tx_hashes: Mutex<HashSet<String>>,
     unique_block_heights: Mutex<HashSet<u64>>,
+    // Per-topic tx_hash tracking for accurate duplicate detection
+    unique_tx_per_topic: Mutex<HashMap<String, HashSet<String>>>,
 }
 
 impl StatsTracker {
@@ -172,6 +180,7 @@ impl StatsTracker {
             records_by_topic: Mutex::new(HashMap::new()),
             unique_tx_hashes: Mutex::new(HashSet::new()),
             unique_block_heights: Mutex::new(HashSet::new()),
+            unique_tx_per_topic: Mutex::new(HashMap::new()),
         }
     }
 
@@ -187,13 +196,16 @@ impl StatsTracker {
         let mut per_topic: HashMap<String, u64> = HashMap::new();
         let mut tx_hashes: Vec<String> = Vec::new();
         let mut block_heights: Vec<u64> = Vec::new();
+        // Collect (topic, tx_hash) pairs for per-topic duplicate checking
+        let mut topic_tx_pairs: Vec<(String, String)> = Vec::new();
 
         for record in &batch.records {
             match validate_record(record) {
                 Ok(()) => {
                     *per_topic.entry(record.topic.clone()).or_insert(0) += 1;
                     if let Some(tx) = record.tx_hash.clone() {
-                        tx_hashes.push(tx);
+                        tx_hashes.push(tx.clone());
+                        topic_tx_pairs.push((record.topic.clone(), tx));
                     }
                     if let Some(height) = record.block_height {
                         block_heights.push(height);
@@ -215,11 +227,27 @@ impl StatsTracker {
             }
         }
 
-        let duplicate_tx = {
+        // Track global unique tx_hashes (for stats only, not duplicate detection)
+        {
             let mut seen = self.unique_tx_hashes.lock().unwrap();
-            let mut duplicates = 0;
             for tx in tx_hashes {
-                if !seen.insert(tx) {
+                seen.insert(tx);
+            }
+        }
+
+        // Check for duplicates PER TOPIC (not globally)
+        // Note: Duplicates in hl.trades, hl.fills, hl.transactions are EXPECTED:
+        // - trades/fills have buyer+seller pairs (2 records per tx)
+        // - transactions have batch operations (100+ records per bundle)
+        let duplicate_tx = {
+            let mut per_topic_map = self.unique_tx_per_topic.lock().unwrap();
+            let mut duplicates = 0;
+            for (topic, tx_hash) in topic_tx_pairs {
+                let topic_set = per_topic_map
+                    .entry(topic)
+                    .or_insert_with(HashSet::new);
+                if !topic_set.insert(tx_hash) {
+                    // Same tx_hash appeared twice in the SAME topic
                     duplicates += 1;
                 }
             }
@@ -420,6 +448,13 @@ fn log_stats(previous: &StatsSnapshot, current: &StatsSnapshot, interval: Durati
             .join(", ")
     };
 
+    // Calculate duplicate percentage for context
+    let duplicate_pct = if current.total_records > 0 {
+        (current.duplicate_txs as f64 / current.total_records as f64) * 100.0
+    } else {
+        0.0
+    };
+
     info!(
         total_batches = current.total_batches,
         total_records = current.total_records,
@@ -431,8 +466,14 @@ fn log_stats(previous: &StatsSnapshot, current: &StatsSnapshot, interval: Durati
         unique_block_heights = current.unique_block_heights,
         invalid_records = current.invalid_records,
         duplicate_tx = current.duplicate_txs,
+        duplicate_pct = format!("{:.1}%", duplicate_pct),
+        avg_records_per_tx = if current.unique_tx > 0 {
+            current.total_records as f64 / current.unique_tx as f64
+        } else {
+            0.0
+        },
         topics = %topics_summary,
-        "sorter stats"
+        "sorter stats (duplicates are EXPECTED: trades/fills have buyer+seller pairs, txs have batches)"
     );
 }
 

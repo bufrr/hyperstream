@@ -1,4 +1,4 @@
-use crate::parsers::{parse_iso8601_to_millis, Parser};
+use crate::parsers::{parse_iso8601_to_millis, partition_key_or_unknown, Parser};
 use crate::sorter_client::proto::DataRecord;
 use anyhow::{Context, Result};
 use rmp_serde::decode::Error as RmpError;
@@ -85,11 +85,10 @@ impl Parser for BlocksParser {
                     let payload = serde_json::to_vec(&block)
                         .context("failed to encode block payload as JSON")?;
 
-                    let partition_key = if block.height == 0 {
-                        "unknown".to_string()
-                    } else {
-                        block.height.to_string()
-                    };
+                    let height_str = block.height.to_string();
+                    let partition_key = partition_key_or_unknown(
+                        if block.height == 0 { "" } else { &height_str }
+                    );
 
                     records.push(DataRecord {
                         block_height: if block.height == 0 {

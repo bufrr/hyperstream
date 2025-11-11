@@ -21,11 +21,20 @@ watch_paths = [
     "node_fills_by_block",            # Fill data (batch format)
     "node_order_statuses",            # Fill data (single-record format)
     "node_raw_book_diffs",            # Order book data
-    "misc_events"                     # Miscellaneous events
+    "misc_events_by_block"            # Miscellaneous events (use _by_block variant)
 ]
 
 # Polling interval in milliseconds (default: 100)
 poll_interval_ms = 100
+
+# Skip historical data and only process new data after startup (default: true)
+# - true: Start from end of existing files (RECOMMENDED for production)
+#         Prevents OOM crashes when starting with 100s of GB of historical data
+# - false: Process all historical data from the beginning (use for backfilling)
+#
+# IMPORTANT: When deploying with many existing files, keep this as 'true' to avoid
+#            processing hundreds of GB on first startup which causes memory exhaustion.
+skip_historical = true
 
 [sorter]
 # Choose ONE of the following output modes:

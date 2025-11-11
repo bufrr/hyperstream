@@ -1,4 +1,7 @@
-use crate::parsers::{drain_complete_lines, parse_iso8601_to_millis, trim_line_bytes, Parser};
+use crate::parsers::{
+    drain_complete_lines, line_preview, parse_iso8601_to_millis, partition_key_or_unknown,
+    trim_line_bytes, Parser,
+};
 use crate::sorter_client::proto::DataRecord;
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
@@ -117,11 +120,7 @@ impl Parser for TransactionsParser {
                                 error: None,
                             };
 
-                            let partition_key = if tx_hash.is_empty() {
-                                "unknown".to_string()
-                            } else {
-                                tx_hash.clone()
-                            };
+                            let partition_key = partition_key_or_unknown(&tx_hash);
 
                             let payload = serde_json::to_vec(&transaction)
                                 .context("failed to encode transaction payload to JSON")?;
@@ -157,7 +156,7 @@ impl Parser for TransactionsParser {
                     );
                 }
                 Err(err) => {
-                    let preview = line_preview(&line);
+                    let preview = line_preview(&line, LINE_PREVIEW_LIMIT);
                     warn!(
                         error = %err,
                         line_idx,
@@ -177,20 +176,6 @@ impl Parser for TransactionsParser {
     }
 }
 
-fn line_preview(line: &[u8]) -> String {
-    let text = String::from_utf8_lossy(line);
-    let mut preview = String::new();
-    let mut consumed = 0usize;
-    for ch in text.chars() {
-        if consumed >= LINE_PREVIEW_LIMIT {
-            preview.push('…');
-            return preview;
-        }
-        preview.push(ch);
-        consumed += 1;
-    }
-    preview
-}
 
 /// Upstream sometimes supplies `resps` as an array or as a map keyed by opaque strings.
 /// This deserializer flattens both layouts into a single vector so the rest of the code
