@@ -23,7 +23,7 @@ fn test_transactions() {
         let mut parser = TransactionsParser::default();
         match parser.parse(prod_path, &data) {
             Ok(records) => println!("  ✓ Production data: {} records", records.len()),
-            Err(e) => println!("  ✗ Production data error: {}", e),
+            Err(e) => println!("  ✗ Production data error: {e}"),
         }
     }
 
@@ -44,7 +44,7 @@ fn test_transactions() {
                 }
                 println!("✓ Parsed {} records total:", records.len());
                 for (topic, count) in &topic_counts {
-                    println!("   - {}: {} records", topic, count);
+                    println!("   - {topic}: {count} records");
                 }
                 if let Some(first) = records.first() {
                     println!("  First record topic: {}", first.topic);
@@ -53,7 +53,7 @@ fn test_transactions() {
             }
         }
         Err(e) => {
-            println!("✗ Parse error: {}", e);
+            println!("✗ Parse error: {e}");
         }
     }
     println!("  Backlog: {} bytes", parser.backlog_len());
@@ -74,7 +74,7 @@ fn test_orders() {
             }
         }
         Err(e) => {
-            println!("✗ Parse error: {}", e);
+            println!("✗ Parse error: {e}");
         }
     }
     println!("  Backlog: {} bytes", parser.backlog_len());
@@ -95,7 +95,7 @@ fn test_blocks() {
             }
         }
         Err(e) => {
-            println!("✗ Parse error: {}", e);
+            println!("✗ Parse error: {e}");
         }
     }
     println!("  Backlog: {} bytes", parser.backlog_len());

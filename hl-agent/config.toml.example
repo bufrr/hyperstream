@@ -15,12 +15,10 @@ data_dir = "~/hl-data"
 # NOTE: The watcher uses recursive mode, so specifying parent directories
 #       will automatically detect files in all subdirectories (e.g., date-based dirs)
 watch_paths = [
-    "periodic_abci_states",            # Block data (watches all subdirs like 20251107/)
-    "replica_cmds",                    # Transaction data (watches timestamp dirs like 2025-11-07T*/)
+    "replica_cmds",                    # Blocks + Transactions (JSONL in timestamp dirs like 2025-11-07T*/)
     "node_trades",                     # Trade data
-    "node_fills_by_block",            # Fill data (batch format)
-    "node_order_statuses",            # Fill data (single-record format)
-    "node_raw_book_diffs",            # Order book data
+    "node_fills_by_block",            # Fill data (batch format) - produces fills + trades
+    "node_order_statuses_by_block",   # Order status data
     "misc_events_by_block"            # Miscellaneous events (use _by_block variant)
 ]
 
@@ -57,3 +55,22 @@ db_path = "~/.hl-agent/checkpoint.db"
 # Update frequency (records between checkpoints)
 # Default: 1000
 # update_interval_records = 1000
+
+[performance]
+# Performance tuning parameters
+# These settings control resource limits and memory usage
+
+# Maximum number of concurrent file tailer tasks (default: 64)
+# Increase on high-end servers with many CPU cores and file descriptors
+# Decrease on resource-constrained environments
+# max_concurrent_tailers = 64
+
+# Bulk loading thresholds for MessagePack files (periodic_abci_states)
+# These prevent OOM when processing large block files
+
+# Warn when bulk-loading files exceed this size (default: 524288000 = 500 MiB)
+# bulk_load_warn_bytes = 524288000
+
+# Abort bulk-loading when files exceed this size (default: 1073741824 = 1 GiB)
+# If your block files exceed this, consider switching to streaming MessagePack parsing
+# bulk_load_abort_bytes = 1073741824

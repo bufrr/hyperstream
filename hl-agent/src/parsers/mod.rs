@@ -3,6 +3,7 @@ use anyhow::{anyhow, Result};
 use std::path::Path;
 
 pub mod blocks;
+mod fill_types;
 pub mod fills;
 pub mod misc_events;
 pub mod orders;
@@ -16,34 +17,71 @@ pub use orders::OrdersParser;
 pub use trades::TradesParser;
 pub use transactions::TransactionsParser;
 
+/// State machine that converts file fragments produced by the tailer into `DataRecord`s.
+///
+/// Parsers own whatever incremental buffers they need and are invoked every time the tailer reads
+/// another chunk from disk. Implementations should avoid blocking work and only keep lightweight
+/// state so multiple parsers can be run for the same file.
+///
+/// # Examples
+///
+/// ```
+/// # use anyhow::Result;
+/// use hl_agent::parsers::{BlocksParser, Parser};
+/// use std::path::Path;
+///
+/// # fn demo() -> Result<()> {
+/// let mut parser = BlocksParser::default();
+/// let payload = br#"{"abci_block":{"round":1,"proposer":"","time":"","signed_action_bundles":[]}}"#;
+/// let records = parser.parse(Path::new("replica_cmds/sample.jsonl"), payload)?;
+/// assert!(records.is_empty());
+/// # Ok(())
+/// # }
+/// # demo().unwrap();
+/// ```
 pub trait Parser: Send {
+    /// Consume a new chunk of bytes for `file_path` and emit the parsed `DataRecord`s.
+    ///
+    /// Tailers will call `parse` repeatedly whenever new bytes are available. Implementations can
+    /// buffer partial lines between calls, but they should never mutate the `data` slice or block
+    /// the async tailer thread from making progress.
     fn parse(&mut self, file_path: &Path, data: &[u8]) -> Result<Vec<DataRecord>>;
+
+    /// Return how many bytes are still buffered internally.
+    ///
+    /// This value lets the tailer compute a safe checkpoint: it subtracts the backlog size from the
+    /// current file offset so that restarted runs re-feed any partial lines still in memory. A
+    /// parser that performs its own buffering must reflect that state here.
     fn backlog_len(&self) -> usize;
 }
 
-pub fn route_parser(file_path: &Path) -> Result<Box<dyn Parser>> {
-    if path_contains(file_path, "periodic_abci_states") {
-        return Ok(Box::new(BlocksParser::default()));
-    }
+pub fn route_parser(file_path: &Path) -> Result<Vec<Box<dyn Parser>>> {
+    // replica_cmds emits both blocks and transactions from the same JSONL files
     if path_contains(file_path, "replica_cmds") {
-        return Ok(Box::new(TransactionsParser::default()));
+        return Ok(vec![
+            Box::new(BlocksParser::default()),
+            Box::new(TransactionsParser::default()),
+        ]);
     }
+    // node_trades or node_trades_by_block (symlink to node_fills_by_block) for trades aggregation
     if path_contains(file_path, "node_trades") {
-        return Ok(Box::new(TradesParser::default()));
+        return Ok(vec![Box::new(TradesParser::default())]);
     }
+    // node_fills_by_block contains fill data which should generate hl.fills topic
+    if path_contains(file_path, "node_fills_by_block") {
+        return Ok(vec![
+            Box::new(FillsParser::default()),
+            Box::new(TradesParser::default()),
+        ]);
+    }
+    // Order status updates generate hl.orders topic
     if path_contains(file_path, "node_order_statuses")
-        || path_contains(file_path, "node_fills_by_block")
         || path_contains(file_path, "node_order_statuses_by_block")
     {
-        return Ok(Box::new(FillsParser::default()));
-    }
-    if path_contains(file_path, "node_raw_book_diffs")
-        || path_contains(file_path, "node_raw_book_diffs_by_block")
-    {
-        return Ok(Box::new(OrdersParser::default()));
+        return Ok(vec![Box::new(OrdersParser::default())]);
     }
     if path_contains(file_path, "misc_events") || path_contains(file_path, "misc_events_by_block") {
-        return Ok(Box::new(MiscEventsParser::default()));
+        return Ok(vec![Box::new(MiscEventsParser::default())]);
     }
 
     Err(anyhow!(
@@ -89,14 +127,12 @@ pub(crate) fn trim_line_bytes(mut line: Vec<u8>) -> Vec<u8> {
 pub(crate) fn line_preview(line: &[u8], limit: usize) -> String {
     let text = String::from_utf8_lossy(line);
     let mut preview = String::new();
-    let mut consumed = 0usize;
-    for ch in text.chars() {
-        if consumed >= limit {
+    for (idx, ch) in text.chars().enumerate() {
+        if idx >= limit {
             preview.push('…');
             return preview;
         }
         preview.push(ch);
-        consumed += 1;
     }
     preview
 }
@@ -192,7 +228,7 @@ pub(crate) fn parse_iso8601_to_millis(input: &str) -> Option<u64> {
 
     if let Some(stripped) = body.strip_suffix('Z').or_else(|| body.strip_suffix('z')) {
         body = stripped;
-    } else if let Some(idx) = body.rfind(|c| c == '+' || c == '-') {
+    } else if let Some(idx) = body.rfind(['+', '-']) {
         if let Some(t_pos) = body.find('T') {
             if idx > t_pos {
                 let tz_part = &body[idx..];
@@ -244,6 +280,24 @@ pub(crate) fn parse_iso8601_to_millis(input: &str) -> Option<u64> {
     }
 }
 
+pub(crate) fn normalize_tx_hash(hash: &str) -> Option<String> {
+    let trimmed = hash.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+
+    let without_prefix = trimmed
+        .strip_prefix("0x")
+        .or_else(|| trimmed.strip_prefix("0X"))
+        .unwrap_or(trimmed);
+
+    if without_prefix.chars().all(|c| c == '0') {
+        return None;
+    }
+
+    Some(trimmed.to_string())
+}
+
 fn parse_timezone_offset_minutes(part: &str) -> Option<i32> {
     if part.len() < 2 {
         return None;
@@ -291,7 +345,7 @@ fn parse_fractional_nanos(fraction: &str) -> Option<u32> {
 }
 
 fn days_from_civil(year: i32, month: u32, day: u32) -> Option<i64> {
-    if month < 1 || month > 12 || day < 1 || day > 31 {
+    if !(1..=12).contains(&month) || !(1..=31).contains(&day) {
         return None;
     }
     let era_adjusted_year = year - (month <= 2) as i32;
@@ -303,9 +357,80 @@ fn days_from_civil(year: i32, month: u32, day: u32) -> Option<i64> {
     let year_of_era = era_adjusted_year - era * 400;
     let month_adjusted = month as i32 + if month > 2 { -3 } else { 9 };
     let day_of_year = (153 * month_adjusted + 2) / 5 + day as i32 - 1;
-    let day_of_era = year_of_era as i64 * 365
-        + year_of_era as i64 / 4
-        - year_of_era as i64 / 100
+    let day_of_era = year_of_era as i64 * 365 + year_of_era as i64 / 4 - year_of_era as i64 / 100
         + day_of_year as i64;
     Some(era as i64 * 146_097 + day_of_era - 719468)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::parse_iso8601_to_millis;
+    use chrono::{DateTime, FixedOffset};
+
+    fn chrono_millis(reference: &str) -> u64 {
+        DateTime::<FixedOffset>::parse_from_rfc3339(reference)
+            .expect("reference timestamp should parse")
+            .timestamp_millis() as u64
+    }
+
+    fn assert_timestamp_matches(input: &str, reference: &str) {
+        let expected = chrono_millis(reference);
+        assert_eq!(
+            parse_iso8601_to_millis(input),
+            Some(expected),
+            "{input} should equal {reference}"
+        );
+    }
+
+    #[test]
+    fn parses_leap_year_zulu_timestamp() {
+        assert_timestamp_matches(
+            "2024-02-29T23:59:59.999Z",
+            "2024-02-29T23:59:59.999Z",
+        );
+    }
+
+    #[test]
+    fn parses_lowercase_z_and_long_fractional_precision() {
+        assert_timestamp_matches(
+            "2023-05-10T08:15:30.123456789z",
+            "2023-05-10T08:15:30.123456789Z",
+        );
+    }
+
+    #[test]
+    fn applies_positive_timezone_offsets_with_minutes() {
+        assert_timestamp_matches(
+            "2023-05-10T08:15:30.250+05:45",
+            "2023-05-10T08:15:30.250+05:45",
+        );
+    }
+
+    #[test]
+    fn applies_negative_timezone_without_colon() {
+        assert_timestamp_matches(
+            "2019-12-31T18:00:00-0530",
+            "2019-12-31T18:00:00-05:30",
+        );
+    }
+
+    #[test]
+    fn rejects_pre_epoch_timestamps() {
+        assert_eq!(
+            parse_iso8601_to_millis("1969-12-31T23:59:59Z"),
+            None
+        );
+    }
+
+    #[test]
+    fn rejects_impossible_dates_and_missing_time() {
+        assert_eq!(parse_iso8601_to_millis("2024-13-01T00:00:00Z"), None);
+        assert_eq!(parse_iso8601_to_millis("2024-01-01"), None);
+    }
+
+    #[test]
+    fn rejects_invalid_strings_and_empty_input() {
+        assert_eq!(parse_iso8601_to_millis(""), None);
+        assert_eq!(parse_iso8601_to_millis("invalid"), None);
+    }
 }

@@ -1,6 +1,6 @@
 use anyhow::{anyhow, Result};
 use tokio::sync::mpsc;
-use tokio_stream::wrappers::UnboundedReceiverStream;
+use tokio_stream::wrappers::ReceiverStream;
 use tonic::transport::Channel;
 use tonic::Request;
 
@@ -13,14 +13,14 @@ use proto::{DataBatch, DataRecord, SourceMetadata};
 
 #[derive(Clone)]
 pub struct BatchSender {
-    tx: mpsc::UnboundedSender<DataBatch>,
+    tx: mpsc::Sender<DataBatch>,
     node_id: String,
     agent_id: String,
 }
 
 impl BatchSender {
     /// Queue a batch for transmission.
-    pub fn send_batch(
+    pub async fn send_batch(
         &self,
         file_path: String,
         byte_offset: u64,
@@ -42,6 +42,7 @@ impl BatchSender {
 
         self.tx
             .send(batch)
+            .await
             .map_err(|err| anyhow!("failed to enqueue batch for sorter stream: {err}"))
     }
 }
@@ -55,7 +56,14 @@ pub struct SorterClient {
 
 impl SorterClient {
     pub async fn connect(endpoint: String, node_id: String) -> Result<Self> {
-        let client = SorterServiceClient::connect(endpoint).await?;
+        // Increase gRPC message size limits to handle large batches
+        // Default: 4MB, Increased to: 100MB
+        const MAX_MESSAGE_SIZE: usize = 100 * 1024 * 1024; // 100 MB
+
+        let client = SorterServiceClient::connect(endpoint)
+            .await?
+            .max_encoding_message_size(MAX_MESSAGE_SIZE)
+            .max_decoding_message_size(MAX_MESSAGE_SIZE);
 
         Ok(Self {
             client,
@@ -71,10 +79,11 @@ impl SorterClient {
     /// Start unidirectional streaming session
     /// Returns: batch sender handle
     pub async fn start_stream(&mut self) -> Result<BatchSender> {
-        let (tx, rx) = mpsc::unbounded_channel();
+        // Limit in-flight batches so a slow gRPC sink can't grow memory without bound.
+        let (tx, rx) = mpsc::channel(1000);
 
         let mut client = self.client.clone();
-        let request = Request::new(UnboundedReceiverStream::new(rx));
+        let request = Request::new(ReceiverStream::new(rx));
 
         tokio::spawn(async move {
             if let Err(err) = client.stream_data(request).await {

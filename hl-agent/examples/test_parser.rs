@@ -6,14 +6,14 @@ fn main() {
 
     let sample_file = "/tmp/3_compact.jsonl";
 
-    println!("📁 Reading file: {}", sample_file);
+    println!("📁 Reading file: {sample_file}");
     let sample_data = match std::fs::read(sample_file) {
         Ok(data) => {
             println!("✅ Read {} bytes", data.len());
             data
         }
         Err(e) => {
-            eprintln!("❌ Failed to read file: {}", e);
+            eprintln!("❌ Failed to read file: {e}");
             return;
         }
     };
@@ -46,8 +46,8 @@ fn main() {
                 if let Ok(json) = serde_json::from_slice::<serde_json::Value>(&first.payload) {
                     println!("📄 Payload (formatted):");
                     let formatted = serde_json::to_string_pretty(&json).unwrap();
-                    for (i, line) in formatted.lines().take(15).enumerate() {
-                        println!("  {}", line);
+                    for line in formatted.lines().take(15) {
+                        println!("  {line}");
                     }
                     if formatted.lines().count() > 15 {
                         println!("  ... ({} more lines)", formatted.lines().count() - 15);
@@ -67,7 +67,7 @@ fn main() {
                 "  ├─ Has tx_hash: {}",
                 records.iter().filter(|r| r.tx_hash.is_some()).count()
             );
-            if records.len() > 0 {
+            if !records.is_empty() {
                 println!(
                     "  └─ Avg payload size: {} bytes",
                     records.iter().map(|r| r.payload.len()).sum::<usize>() / records.len()
@@ -75,9 +75,9 @@ fn main() {
             }
         }
         Err(e) => {
-            eprintln!("❌ Parse failed: {}", e);
+            eprintln!("❌ Parse failed: {e}");
             eprintln!("\n🔍 Error details:");
-            eprintln!("{:?}", e);
+            eprintln!("{e:?}");
         }
     }
 }

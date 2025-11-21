@@ -1,0 +1,22 @@
+[node]
+node_id = "verify-all-6-topics"
+data_dir = "~/hl-data"
+
+[watcher]
+# Watch all data source directories for comprehensive 6-topic verification
+watch_paths = [
+    "replica_cmds",                   # hl.blocks + hl.transactions (JSONL in timestamp dirs)
+    "node_fills_by_block",            # hl.fills + hl.trades (JSONL aggregation)
+    "node_order_statuses_by_block",   # hl.orders (JSONL)
+    "misc_events_by_block"            # hl.misc_events (JSONL)
+]
+poll_interval_ms = 100
+skip_historical = true  # Start fresh with latest data only (skip historical files)
+
+[sorter]
+# Use gRPC mock sorter for verification
+endpoint = "http://127.0.0.1:50051"
+batch_size = 100
+
+[checkpoint]
+db_path = "~/.hl-agent/checkpoint-verify-all.db"

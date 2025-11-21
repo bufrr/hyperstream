@@ -15,11 +15,11 @@ use sorter_client::SorterClient;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tailer::tail_file;
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, Semaphore};
 use tokio::task::JoinHandle;
-use tracing::{error, info, warn};
+use tracing::{debug, error, info, warn};
 use watcher::{watch_directories, FileEvent};
 
 const FORCE_FLUSH_ENV: &str = "HL_AGENT_FORCE_FLUSH";
@@ -36,6 +36,7 @@ async fn main() -> Result<()> {
 
     let watch_paths = config.watch_paths();
     let poll_interval = Duration::from_millis(config.watcher.poll_interval_ms);
+    let startup_time = SystemTime::now();
     let checkpoint_db = Arc::new(CheckpointDB::new(config.checkpoint_db_path())?);
     let record_sink: Arc<dyn RecordSink> = if let Some(endpoint) = config.sorter.endpoint.clone() {
         let mut sorter_client =
@@ -83,6 +84,7 @@ async fn main() -> Result<()> {
     });
 
     let mut active_tailers: HashMap<PathBuf, JoinHandle<()>> = HashMap::new();
+    let tailer_semaphore = Arc::new(Semaphore::new(config.performance.max_concurrent_tailers));
 
     let skip_historical = config.skip_historical();
 
@@ -94,6 +96,10 @@ async fn main() -> Result<()> {
         poll_interval,
         batch_size,
         skip_historical,
+        startup_time,
+        tailer_semaphore.clone(),
+        config.performance.bulk_load_warn_bytes,
+        config.performance.bulk_load_abort_bytes,
     )
     .await
     {
@@ -108,6 +114,20 @@ async fn main() -> Result<()> {
                 match maybe_event {
                     Some(event) => {
                         let path = event_path(&event);
+                        if let Err(err) = maybe_skip_historical_for_path(
+                            &path,
+                            &checkpoint_db,
+                            skip_historical,
+                            startup_time,
+                        )
+                        .await
+                        {
+                            warn!(
+                                error = %err,
+                                path = %path.display(),
+                                "failed to honor skip_historical for new file"
+                            );
+                        }
                         spawn_tailer_if_needed(
                             &mut active_tailers,
                             path,
@@ -115,6 +135,9 @@ async fn main() -> Result<()> {
                             record_sink.clone(),
                             poll_interval,
                             batch_size,
+                            tailer_semaphore.clone(),
+                            config.performance.bulk_load_warn_bytes,
+                            config.performance.bulk_load_abort_bytes,
                         );
                     }
                     None => {
@@ -190,6 +213,7 @@ fn event_path(event: &FileEvent) -> PathBuf {
     }
 }
 
+#[allow(clippy::too_many_arguments)] // Tailer start-up depends on many contextual knobs; grouping keeps call site clearer.
 async fn seed_existing_files(
     watch_paths: &[PathBuf],
     active_tailers: &mut HashMap<PathBuf, JoinHandle<()>>,
@@ -198,8 +222,18 @@ async fn seed_existing_files(
     poll_interval: Duration,
     batch_size: usize,
     skip_historical: bool,
+    startup_time: SystemTime,
+    tailer_semaphore: Arc<Semaphore>,
+    bulk_load_warn_bytes: u64,
+    bulk_load_abort_bytes: u64,
 ) -> Result<()> {
-    let existing_files = discover_existing_files(watch_paths)?;
+    let mut existing_files = discover_existing_files(watch_paths)?;
+
+    existing_files.sort_by(|a, b| {
+        let a_priority = file_priority(a.as_path());
+        let b_priority = file_priority(b.as_path());
+        a_priority.cmp(&b_priority).then_with(|| a.cmp(b))
+    });
 
     info!(
         skip_historical,
@@ -208,15 +242,15 @@ async fn seed_existing_files(
     );
 
     for path in existing_files {
-        // If skip_historical is true, set offset to end of file (unless checkpoint already exists)
-        if skip_historical {
-            if let Err(err) = initialize_checkpoint_if_needed(&path, &checkpoint_db).await {
-                warn!(
-                    error = %err,
-                    path = %path.display(),
-                    "failed to initialize checkpoint; will use default behavior"
-                );
-            }
+        if let Err(err) =
+            maybe_skip_historical_for_path(&path, &checkpoint_db, skip_historical, startup_time)
+                .await
+        {
+            warn!(
+                error = %err,
+                path = %path.display(),
+                "failed to initialize checkpoint; will use default behavior"
+            );
         }
 
         spawn_tailer_if_needed(
@@ -226,46 +260,51 @@ async fn seed_existing_files(
             record_sink.clone(),
             poll_interval,
             batch_size,
+            tailer_semaphore.clone(),
+            bulk_load_warn_bytes,
+            bulk_load_abort_bytes,
         );
     }
     Ok(())
 }
 
-async fn initialize_checkpoint_if_needed(
+async fn maybe_skip_historical_for_path(
     path: &PathBuf,
     checkpoint_db: &Arc<CheckpointDB>,
+    skip_historical: bool,
+    startup_time: SystemTime,
 ) -> Result<()> {
-    // Check if checkpoint already exists
-    let existing_checkpoint = checkpoint_db.get(path).await?;
-    if existing_checkpoint.is_none() {
-        // No checkpoint exists, set to end of file to skip historical data
-        set_offset_to_end(path, checkpoint_db).await?;
+    if !skip_historical {
+        return Ok(());
     }
-    Ok(())
-}
 
-async fn set_offset_to_end(path: &PathBuf, checkpoint_db: &Arc<CheckpointDB>) -> Result<()> {
+    let offset = checkpoint_db.get_offset(path).await?;
+    if offset != 0 {
+        return Ok(());
+    }
+
     let metadata = tokio::fs::metadata(path).await?;
+    let last_modified = metadata.modified().unwrap_or(UNIX_EPOCH);
+    if last_modified >= startup_time {
+        return Ok(());
+    }
+
+    let last_modified_ts = last_modified
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_else(|_| Duration::from_secs(0))
+        .as_secs() as i64;
     let file_size = metadata.len();
-    let last_modified = metadata
-        .modified()
-        .ok()
-        .and_then(|t| {
-            t.duration_since(std::time::UNIX_EPOCH)
-                .ok()
-                .map(|d| d.as_secs() as i64)
-        })
-        .unwrap_or(0);
 
     checkpoint_db
-        .set_offset(path, file_size, file_size, last_modified)
+        .set_offset(path, file_size, file_size, last_modified_ts)
         .await?;
 
     info!(
         path = %path.display(),
         offset = file_size,
-        "initialized checkpoint to end of file (skip historical data)"
+        "skip_historical enabled - initialized checkpoint to end of file"
     );
+
     Ok(())
 }
 
@@ -276,6 +315,9 @@ fn spawn_tailer_if_needed(
     record_sink: Arc<dyn RecordSink>,
     poll_interval: Duration,
     batch_size: usize,
+    tailer_semaphore: Arc<Semaphore>,
+    bulk_load_warn_bytes: u64,
+    bulk_load_abort_bytes: u64,
 ) {
     if let Some(handle) = active_tailers.get(&path) {
         if handle.is_finished() {
@@ -285,19 +327,53 @@ fn spawn_tailer_if_needed(
         }
     }
 
-    if let Err(err) = ensure_parsable(&path) {
-        warn!(error = %err, path = %path.display(), "skipping unrecognized file");
-        return;
+    let parsers = match route_parser(&path) {
+        Ok(parsers) => parsers,
+        Err(err) => {
+            warn!(error = %err, path = %path.display(), "skipping unrecognized file");
+            return;
+        }
+    };
+
+    let is_periodic_abci = path
+        .iter()
+        .any(|component| component.to_str() == Some("periodic_abci_states"));
+    let is_replica_cmds = path
+        .iter()
+        .any(|component| component.to_str() == Some("replica_cmds"));
+
+    if is_periodic_abci {
+        info!(
+            path = %path.display(),
+            "spawning tailer for periodic_abci_states file"
+        );
+    } else if is_replica_cmds {
+        info!(
+            path = %path.display(),
+            "spawning tailer for replica_cmds file"
+        );
+    } else {
+        debug!(path = %path.display(), "spawning tailer for file");
     }
 
     let tail_path = path.clone();
+    let semaphore = tailer_semaphore.clone();
     let handle = tokio::spawn(async move {
+        let permit = semaphore.acquire_owned().await;
+        if permit.is_err() {
+            warn!(path = %tail_path.display(), "tailer semaphore closed; skipping file");
+            return;
+        }
+        let _permit = permit.unwrap();
         if let Err(err) = tail_file(
             tail_path.clone(),
+            parsers,
             checkpoint_db,
             record_sink,
             batch_size,
             poll_interval,
+            bulk_load_warn_bytes,
+            bulk_load_abort_bytes,
         )
         .await
         {
@@ -308,19 +384,31 @@ fn spawn_tailer_if_needed(
     active_tailers.insert(path, handle);
 }
 
-fn ensure_parsable(path: &Path) -> Result<()> {
-    route_parser(path)?;
-    Ok(())
+fn file_priority(path: &Path) -> u8 {
+    if path
+        .iter()
+        .any(|component| component.to_str() == Some("node_fills_by_block"))
+    {
+        0
+    } else {
+        1
+    }
 }
 
 fn discover_existing_files(paths: &[PathBuf]) -> Result<Vec<PathBuf>> {
     let mut files = Vec::new();
     for path in paths {
+        debug!(path = %path.display(), "scanning watch path for existing files");
         if !path.exists() {
+            debug!(
+                path = %path.display(),
+                "watch path does not exist on disk; skipping"
+            );
             continue;
         }
         collect_files(path, &mut files)?;
     }
+    debug!(file_count = files.len(), "discover_existing_files complete");
     Ok(files)
 }
 
@@ -328,8 +416,22 @@ fn collect_files(path: &Path, files: &mut Vec<PathBuf>) -> Result<()> {
     let metadata = std::fs::metadata(path)
         .with_context(|| format!("failed to read metadata for {}", path.display()))?;
     if metadata.is_file() {
-        if ensure_parsable(path).is_ok() {
-            files.push(path.to_path_buf());
+        debug!(path = %path.display(), "found file candidate while seeding");
+        match route_parser(path) {
+            Ok(_) => {
+                debug!(
+                    path = %path.display(),
+                    "route_parser matched file; scheduling for tailing"
+                );
+                files.push(path.to_path_buf());
+            }
+            Err(err) => {
+                debug!(
+                    path = %path.display(),
+                    error = %err,
+                    "route_parser rejected file; skipping"
+                );
+            }
         }
         return Ok(());
     }

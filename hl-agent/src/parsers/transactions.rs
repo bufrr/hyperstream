@@ -1,77 +1,117 @@
+use crate::parsers::blocks::{proposer_cache, SharedProposerCache};
 use crate::parsers::{
     drain_complete_lines, line_preview, parse_iso8601_to_millis, partition_key_or_unknown,
     trim_line_bytes, Parser,
 };
 use crate::sorter_client::proto::DataRecord;
 use anyhow::{Context, Result};
-use serde::{Deserialize, Serialize};
-use serde_json::{self, Value};
+use serde::{de::Deserializer, Deserialize, Serialize};
+use serde_json::Value;
 use std::path::Path;
-use tracing::{debug, warn};
+use tracing::warn;
 
 const LINE_PREVIEW_LIMIT: usize = 256;
 
-#[derive(Default)]
+/// Decodes `replica_cmds` lines containing blocks and responses into `hl.transactions` records.
+///
+/// The parser aligns signed actions with execution responses, emits a `DataRecord` per transaction,
+/// and keeps track of proposer data shared with the blocks parser.
 pub struct TransactionsParser {
     buffer: Vec<u8>,
+    proposer_cache: SharedProposerCache,
 }
 
 #[derive(Serialize)]
-struct Transaction {
+#[serde(rename_all = "camelCase")]
+struct TransactionRecord {
     time: u64,
     user: String,
     hash: String,
     action: Value,
     block: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
     error: Option<String>,
 }
 
 #[derive(Deserialize)]
 struct ReplicaCmd {
     abci_block: AbciBlock,
-    #[serde(rename = "resps", default, deserialize_with = "deserialize_value_vec")]
-    _resps: Vec<Value>,
+    #[serde(default)]
+    resps: Option<Resps>,
 }
 
-#[allow(dead_code)]
 #[derive(Deserialize)]
 struct AbciBlock {
+    #[serde(default, deserialize_with = "string_or_default")]
     time: String,
-    #[serde(default)]
     round: u64,
-    #[serde(default, deserialize_with = "deserialize_signed_action_bundles")]
-    signed_action_bundles: Vec<SignedActionBundle>,
+    #[serde(default, deserialize_with = "string_or_default")]
+    proposer: String,
     #[serde(default)]
-    proposer: Option<String>,
-    #[serde(default)]
-    parent_round: Option<u64>,
-    #[serde(default)]
-    hardfork: Option<Value>,
+    signed_action_bundles: Vec<BundleWithHash>,
 }
 
-type SignedActionBundle = (String, SignedActions); // (hash, actions)
-
-#[allow(dead_code)]
 #[derive(Deserialize)]
-struct SignedActions {
-    #[serde(default, deserialize_with = "deserialize_signed_actions_array")]
+struct BundlePayload {
+    #[serde(
+        default,
+        rename = "broadcaster",
+        deserialize_with = "string_or_default"
+    )]
+    _broadcaster: String,
+    #[serde(default)]
     signed_actions: Vec<SignedAction>,
-    #[serde(default)]
-    broadcaster: String,
-    #[serde(default)]
-    broadcaster_nonce: u64,
 }
 
-#[allow(dead_code)]
+#[derive(Deserialize)]
+struct BundleWithHash(
+    #[serde(deserialize_with = "string_or_default")] String,
+    BundlePayload,
+);
+
 #[derive(Deserialize)]
 struct SignedAction {
-    #[serde(rename = "vaultAddress", default)]
-    vault_address: Option<String>,
+    #[serde(default)]
     action: Value,
+    #[serde(default, rename = "nonce")]
+    _nonce: u64,
+}
+
+#[derive(Deserialize, Default)]
+struct Resps {
+    #[serde(rename = "Full", default)]
+    full: Vec<ResponseBundle>,
+}
+
+#[derive(Deserialize)]
+struct ResponseBundle(
+    #[serde(deserialize_with = "string_or_default")] String,
+    Vec<ActionResponse>,
+);
+
+#[derive(Deserialize)]
+struct ActionResponse {
+    #[serde(default, deserialize_with = "string_or_default")]
+    user: String,
     #[serde(default)]
-    nonce: u64,
+    res: ResponseResult,
+}
+
+#[derive(Deserialize, Default)]
+struct ResponseResult {
+    #[serde(default, deserialize_with = "string_or_default")]
+    status: String,
     #[serde(default)]
-    signature: Value,
+    response: Value,
+}
+
+impl Default for TransactionsParser {
+    fn default() -> Self {
+        Self {
+            buffer: Vec::new(),
+            proposer_cache: proposer_cache(),
+        }
+    }
 }
 
 impl Parser for TransactionsParser {
@@ -86,83 +126,16 @@ impl Parser for TransactionsParser {
                 continue;
             }
 
-            let line_len = line.len();
             match serde_json::from_slice::<ReplicaCmd>(&line) {
-                Ok(replica_cmd) => {
-                    let block_number = replica_cmd.abci_block.round;
-                    let block_timestamp =
-                        parse_iso8601_to_millis(&replica_cmd.abci_block.time).unwrap_or(0);
-                    let block_height = if block_number == 0 {
-                        None
-                    } else {
-                        Some(block_number)
-                    };
-                    let bundle_count = replica_cmd.abci_block.signed_action_bundles.len();
-
-                    debug!(
-                        line_idx,
-                        line_len,
-                        block_round = block_number,
-                        bundle_count,
-                        "parsed replica_cmd line"
-                    );
-
-                    // Extract transactions from signed_action_bundles
-                    let mut tx_emitted = 0usize;
-                    for (tx_hash, signed_actions) in replica_cmd.abci_block.signed_action_bundles {
-                        for signed_action in signed_actions.signed_actions {
-                            let transaction = Transaction {
-                                time: block_timestamp,
-                                hash: tx_hash.clone(),
-                                user: signed_action.vault_address.clone().unwrap_or_default(),
-                                action: signed_action.action,
-                                block: block_number,
-                                error: None,
-                            };
-
-                            let partition_key = partition_key_or_unknown(&tx_hash);
-
-                            let payload = serde_json::to_vec(&transaction)
-                                .context("failed to encode transaction payload to JSON")?;
-
-                            // Transactions are timestamped with the enclosing block time.
-                            records.push(DataRecord {
-                                block_height,
-                                tx_hash: if tx_hash.is_empty() {
-                                    None
-                                } else {
-                                    Some(tx_hash.clone())
-                                },
-                                timestamp: block_timestamp,
-                                topic: "hl.transactions".to_string(),
-                                partition_key,
-                                payload,
-                            });
-                            tx_emitted += 1;
-                            debug!(
-                                topic = "hl.transactions",
-                                block_round = block_number,
-                                tx_hash = %tx_hash,
-                                "emitted record"
-                            );
-                        }
-                    }
-
-                    debug!(
-                        line_idx,
-                        block_round = block_number,
-                        tx_emitted,
-                        "replica_cmd line emitted records"
-                    );
+                Ok(cmd) => {
+                    self.process_replica_cmd(cmd, &mut records)?;
                 }
                 Err(err) => {
-                    let preview = line_preview(&line, LINE_PREVIEW_LIMIT);
                     warn!(
                         error = %err,
                         line_idx,
-                        line_len,
-                        preview = %preview,
-                        "failed to parse replica_cmds JSON line"
+                        preview = %line_preview(&line, LINE_PREVIEW_LIMIT),
+                        "failed to parse replica_cmds line"
                     );
                 }
             }
@@ -176,146 +149,133 @@ impl Parser for TransactionsParser {
     }
 }
 
+impl TransactionsParser {
+    fn process_replica_cmd(&self, cmd: ReplicaCmd, records: &mut Vec<DataRecord>) -> Result<()> {
+        let ReplicaCmd { abci_block, resps } = cmd;
+        let AbciBlock {
+            time,
+            round,
+            proposer,
+            signed_action_bundles,
+        } = abci_block;
 
-/// Upstream sometimes supplies `resps` as an array or as a map keyed by opaque strings.
-/// This deserializer flattens both layouts into a single vector so the rest of the code
-/// can treat it uniformly.
-fn deserialize_value_vec<'de, D>(deserializer: D) -> Result<Vec<Value>, D::Error>
-where
-    D: serde::Deserializer<'de>,
-{
-    collect_sequence_like(deserializer, "vector field")
-}
-
-/// Signed action bundles arrive either as an array of `[tx_hash, bundle]` tuples or as an
-/// object keyed by transaction hash. We normalize both shapes into `(hash, bundle)` pairs.
-fn deserialize_signed_action_bundles<'de, D>(
-    deserializer: D,
-) -> Result<Vec<SignedActionBundle>, D::Error>
-where
-    D: serde::Deserializer<'de>,
-{
-    let value = Option::<Value>::deserialize(deserializer)?;
-    match value {
-        None | Some(Value::Null) => Ok(Vec::new()),
-        Some(Value::Array(arr)) => arr
-            .into_iter()
-            .map(|item| serde_json::from_value(item).map_err(serde::de::Error::custom))
-            .collect(),
-        Some(Value::Object(map)) => map
-            .into_iter()
-            .map(|(hash, bundle_value)| {
-                serde_json::from_value(bundle_value)
-                    .map(|actions| (hash, actions))
-                    .map_err(serde::de::Error::custom)
-            })
-            .collect(),
-        Some(other) => Err(serde::de::Error::custom(format!(
-            "expected signed action bundles array or map, got {other:?}"
-        ))),
-    }
-}
-
-/// Similar to bundles, `signed_actions` might be either an array or an object keyed by nonce.
-/// This keeps deserialization resilient to both versions.
-fn deserialize_signed_actions_array<'de, D>(deserializer: D) -> Result<Vec<SignedAction>, D::Error>
-where
-    D: serde::Deserializer<'de>,
-{
-    collect_sequence_like(deserializer, "signed actions")?
-        .into_iter()
-        .map(|item| serde_json::from_value(item).map_err(serde::de::Error::custom))
-        .collect()
-}
-
-fn collect_sequence_like<'de, D>(
-    deserializer: D,
-    label: &'static str,
-) -> Result<Vec<Value>, D::Error>
-where
-    D: serde::Deserializer<'de>,
-{
-    let value = Option::<Value>::deserialize(deserializer)?;
-    match value {
-        None | Some(Value::Null) => Ok(Vec::new()),
-        Some(Value::Array(items)) => Ok(items),
-        Some(Value::Object(map)) => Ok(map.into_values().collect()),
-        Some(other) => Err(serde::de::Error::custom(format!(
-            "expected {label} array or object, got {other:?}"
-        ))),
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn replica_cmd_accepts_mixed_structures() {
-        let json = r#"
-        {
-            "abci_block": {
-                "time": "2024-06-01T00:00:00.000000000",
-                "round": 42,
-                "signed_action_bundles": {
-                    "0xabc": {
-                        "broadcaster": "node",
-                        "signed_actions": {
-                            "first": {
-                                "vaultAddress": "vault",
-                                "action": {"kind": "test"},
-                                "nonce": 7,
-                                "signature": {}
-                            }
-                        }
-                    }
-                }
-            },
-            "resps": {
-                "foo": {"bar": 1}
-            }
+        if !(round == 0 || proposer.is_empty()) {
+            self.proposer_cache.insert(round, proposer);
         }
-        "#;
 
-        let parsed: ReplicaCmd = serde_json::from_str(json).expect("should parse");
-        assert_eq!(parsed._resps.len(), 1);
-        assert_eq!(parsed.abci_block.signed_action_bundles.len(), 1);
-        let (hash, bundle) = &parsed.abci_block.signed_action_bundles[0];
-        assert_eq!(hash, "0xabc");
-        assert_eq!(bundle.signed_actions.len(), 1);
-        assert_eq!(bundle.signed_actions[0].nonce, 7);
-    }
+        // Use round as block_height (no mapping available)
+        let block_height = round;
 
-    #[test]
-    fn signed_actions_accept_array_input() {
-        let json = r#"
-        {
-            "abci_block": {
-                "time": "2024-06-01T00:00:00.000000000",
-                "round": 1,
-                "signed_action_bundles": [
-                    [
-                        "0xabc",
-                        {
-                            "signed_actions": [
-                                {
-                                    "vaultAddress": "vault",
-                                    "action": {"kind": "array"},
-                                    "nonce": 1,
-                                    "signature": {}
-                                }
-                            ]
-                        }
-                    ]
-                ]
-            }
+        let timestamp = parse_iso8601_to_millis(&time).unwrap_or(0);
+        let actions_with_hashes = flatten_actions_with_hashes(signed_action_bundles);
+        let responses = flatten_responses(resps);
+
+        let action_count = actions_with_hashes.len();
+        let response_count = responses.len();
+        if action_count != response_count {
+            warn!(
+                round,
+                actions = action_count,
+                responses = response_count,
+                "actions/responses length mismatch"
+            );
         }
-        "#;
 
-        let parsed: ReplicaCmd = serde_json::from_str(json).expect("should parse array");
-        assert_eq!(parsed.abci_block.signed_action_bundles.len(), 1);
-        let (_, bundle) = &parsed.abci_block.signed_action_bundles[0];
-        assert_eq!(bundle.signed_actions.len(), 1);
-        assert_eq!(bundle.signed_actions[0].nonce, 1);
+        let mut responses_iter = responses.into_iter();
+        for (hash, signed_action) in actions_with_hashes.into_iter() {
+            let response = responses_iter.next().unwrap_or_else(|| ActionResponse {
+                user: String::new(),
+                res: ResponseResult::default(),
+            });
+            // Hash is extracted from signed_action_bundles[i].0
+            // This is the consensus-generated transaction hash that includes block number
+            let ActionResponse { user, res } = response;
+            let tx = TransactionRecord {
+                time: timestamp,
+                user,
+                hash,
+                action: signed_action.action,
+                block: block_height,
+                error: parse_error(&res),
+            };
+            records.push(transaction_to_data_record(tx, block_height)?);
+        }
+
+        Ok(())
     }
+}
+
+fn flatten_actions_with_hashes(bundles: Vec<BundleWithHash>) -> Vec<(String, SignedAction)> {
+    let mut actions_with_hashes = Vec::new();
+    for BundleWithHash(hash, bundle) in bundles {
+        for action in bundle.signed_actions {
+            actions_with_hashes.push((hash.clone(), action));
+        }
+    }
+    actions_with_hashes
+}
+
+fn flatten_responses(resps: Option<Resps>) -> Vec<ActionResponse> {
+    let mut responses = Vec::new();
+    if let Some(resps) = resps {
+        for ResponseBundle(hash, bundle_responses) in resps.full {
+            let _ = hash;
+            responses.extend(bundle_responses);
+        }
+    }
+    responses
+}
+
+fn transaction_to_data_record(mut tx: TransactionRecord, block_height: u64) -> Result<DataRecord> {
+    let payload = serde_json::to_vec(&tx).context("failed to encode hl.transactions payload")?;
+    let raw_hash = std::mem::take(&mut tx.hash);
+    let metadata_hash = if raw_hash.trim().is_empty() {
+        None
+    } else {
+        Some(raw_hash)
+    };
+
+    Ok(DataRecord {
+        block_height: Some(block_height),
+        tx_hash: metadata_hash,
+        timestamp: tx.time,
+        topic: "hl.transactions".to_string(),
+        partition_key: partition_key_or_unknown(&tx.user),
+        payload,
+    })
+}
+
+fn parse_error(res: &ResponseResult) -> Option<String> {
+    match res.status.as_str() {
+        "err" => res.response.as_str().map(|msg| msg.to_string()),
+        "ok" => match &res.response {
+            Value::Object(map) => map
+                .get("data")
+                .and_then(Value::as_object)
+                .and_then(|data| data.get("statuses"))
+                .and_then(Value::as_array)
+                .map(|statuses| {
+                    statuses
+                        .iter()
+                        .filter_map(|status| {
+                            status
+                                .get("error")
+                                .and_then(Value::as_str)
+                                .map(|msg| msg.to_string())
+                        })
+                        .collect::<Vec<String>>()
+                })
+                .filter(|errors| !errors.is_empty())
+                .map(|errors| errors.join("; ")),
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
+fn string_or_default<'de, D>(deserializer: D) -> std::result::Result<String, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    Option::<String>::deserialize(deserializer).map(|value| value.unwrap_or_default())
 }

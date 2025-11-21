@@ -9,6 +9,8 @@ pub struct Config {
     pub watcher: WatcherConfig,
     pub sorter: SorterConfig,
     pub checkpoint: CheckpointConfig,
+    #[serde(default)]
+    pub performance: PerformanceConfig,
 }
 
 #[derive(Debug, Deserialize, Clone)]
@@ -47,10 +49,26 @@ pub struct CheckpointConfig {
     pub update_interval_records: u64,
 }
 
+#[derive(Debug, Deserialize, Clone)]
+pub struct PerformanceConfig {
+    /// Maximum number of concurrent file tailer tasks (default: 64)
+    #[serde(default = "default_max_concurrent_tailers")]
+    pub max_concurrent_tailers: usize,
+    /// Warn when bulk-loading files exceed this size (default: 500 MiB)
+    #[serde(default = "default_bulk_load_warn_bytes")]
+    pub bulk_load_warn_bytes: u64,
+    /// Abort bulk-loading when files exceed this size (default: 1 GiB)
+    #[serde(default = "default_bulk_load_abort_bytes")]
+    pub bulk_load_abort_bytes: u64,
+}
+
 const DEFAULT_POLL_INTERVAL_MS: u64 = 100;
 const DEFAULT_BATCH_SIZE: usize = 100;
 const DEFAULT_UPDATE_INTERVAL_RECORDS: u64 = 1_000;
 const DEFAULT_SKIP_HISTORICAL: bool = true;
+const DEFAULT_MAX_CONCURRENT_TAILERS: usize = 64;
+const DEFAULT_BULK_LOAD_WARN_BYTES: u64 = 500 * 1024 * 1024; // 500 MiB
+const DEFAULT_BULK_LOAD_ABORT_BYTES: u64 = 1024 * 1024 * 1024; // 1 GiB
 
 fn default_poll_interval_ms() -> u64 {
     DEFAULT_POLL_INTERVAL_MS
@@ -66,6 +84,28 @@ fn default_update_interval_records() -> u64 {
 
 fn default_skip_historical() -> bool {
     DEFAULT_SKIP_HISTORICAL
+}
+
+fn default_max_concurrent_tailers() -> usize {
+    DEFAULT_MAX_CONCURRENT_TAILERS
+}
+
+fn default_bulk_load_warn_bytes() -> u64 {
+    DEFAULT_BULK_LOAD_WARN_BYTES
+}
+
+fn default_bulk_load_abort_bytes() -> u64 {
+    DEFAULT_BULK_LOAD_ABORT_BYTES
+}
+
+impl Default for PerformanceConfig {
+    fn default() -> Self {
+        Self {
+            max_concurrent_tailers: DEFAULT_MAX_CONCURRENT_TAILERS,
+            bulk_load_warn_bytes: DEFAULT_BULK_LOAD_WARN_BYTES,
+            bulk_load_abort_bytes: DEFAULT_BULK_LOAD_ABORT_BYTES,
+        }
+    }
 }
 
 impl Config {

@@ -11,11 +11,10 @@ struct AnyBlock {
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let path = std::env::args().nth(1)
-        .unwrap_or_else(|| {
-            eprintln!("Usage: cargo run --example inspect_blocks <file.rmp>");
-            std::process::exit(1);
-        });
+    let path = std::env::args().nth(1).unwrap_or_else(|| {
+        eprintln!("Usage: cargo run --example inspect_blocks <file.rmp>");
+        std::process::exit(1);
+    });
 
     let data = std::fs::read(&path)?;
     let mut cursor = Cursor::new(&data[..]);
@@ -26,18 +25,19 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             println!("✓ Successfully parsed MessagePack block");
             println!("\nFields found:");
             for (key, value) in &block.fields {
-                println!("  {}: {:?}", key, value);
+                println!("  {key}: {value:?}");
             }
-            
+
             println!("\n=== Full JSON representation ===");
-            println!("{}", serde_json::to_string_pretty(&block.fields)?);
+            let pretty = serde_json::to_string_pretty(&block.fields)?;
+            println!("{pretty}");
         }
         Err(e) => {
-            eprintln!("✗ Failed to parse: {}", e);
+            eprintln!("✗ Failed to parse: {e}");
             eprintln!("\nFirst 200 bytes (hex):");
             for chunk in data.chunks(20).take(10) {
                 for byte in chunk {
-                    eprint!("{:02x} ", byte);
+                    eprint!("{byte:02x} ");
                 }
                 eprintln!();
             }

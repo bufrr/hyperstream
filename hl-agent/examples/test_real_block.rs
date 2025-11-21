@@ -2,7 +2,7 @@ use hl_agent::parsers::{BlocksParser, Parser};
 use std::path::Path;
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let path = "/home/bytenoob/hl-data/periodic_abci_states/20251107/788420000.rmp";
+    let path = "/home/bytenoob/hl-data/periodic_abci_states/20251117/799110000.rmp";
     let data = std::fs::read(path)?;
     println!("Read {} bytes from {}", data.len(), path);
 
@@ -22,7 +22,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
         }
         Err(e) => {
-            eprintln!("✗ Failed to parse: {}", e);
+            eprintln!("✗ Failed to parse: {e}");
             std::process::exit(1);
         }
     }

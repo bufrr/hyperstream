@@ -1,47 +1,79 @@
-use crate::parsers::{drain_complete_lines, line_preview, trim_line_bytes, Parser};
+use crate::parsers::{
+    drain_complete_lines, line_preview, normalize_tx_hash, parse_iso8601_to_millis,
+    partition_key_or_unknown, trim_line_bytes, Parser,
+};
 use crate::sorter_client::proto::DataRecord;
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
-use serde_json::{self, Value};
+use serde_json::Value;
 use std::path::Path;
 use tracing::warn;
 
 const LINE_PREVIEW_LIMIT: usize = 256;
 
+/// Parses `node_order_statuses` JSON lines and produces `hl.orders` status snapshots.
+///
+/// The parser handles both single-event lines and batch envelopes, normalizes hashes, and flattens
+/// the order fields that downstream consumers expect.
 #[derive(Default)]
 pub struct OrdersParser {
     buffer: Vec<u8>,
 }
 
-#[derive(Serialize)]
+#[derive(Serialize, Default)]
 #[serde(rename_all = "camelCase")]
-struct Order {
-    coin: String,
-    side: String,
-    limit_px: String,
-    sz: String,
-    oid: u64,
+struct OrderStatusRecord {
     user: String,
-    book_diff: Value,
+    hash: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    builder: Option<Value>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    time: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    status: Option<Value>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    coin: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    side: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    limit_px: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    sz: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    oid: Option<Value>,
+}
+
+#[derive(Default)]
+struct OrderFieldValues {
+    coin: Option<String>,
+    side: Option<String>,
+    limit_px: Option<String>,
+    sz: Option<String>,
+    oid: Option<Value>,
 }
 
 #[derive(Deserialize)]
 struct NodeOrderBatch {
     #[serde(alias = "blockNumber", alias = "block_number", alias = "block_height")]
     block_number: u64,
-    #[serde(default, deserialize_with = "deserialize_node_book_diffs")]
-    events: Vec<NodeBookDiff>,
+    #[serde(alias = "blockTime", alias = "block_time", default)]
+    block_time: Option<String>,
+    #[serde(default, deserialize_with = "deserialize_node_order_events")]
+    events: Vec<NodeOrderStatus>,
 }
 
 #[derive(Deserialize)]
-struct NodeBookDiff {
+struct NodeOrderStatus {
+    #[serde(default)]
     user: String,
-    oid: u64,
-    coin: String,
-    side: String,
-    px: String,
-    #[serde(alias = "bookDiff", alias = "book_diff")]
-    raw_book_diff: Value,
+    #[serde(default, deserialize_with = "deserialize_option_string")]
+    hash: Option<String>,
+    #[serde(default)]
+    builder: Option<Value>,
+    #[serde(default)]
+    time: Option<String>,
+    #[serde(default)]
+    status: Value,
 }
 
 impl Parser for OrdersParser {
@@ -56,21 +88,27 @@ impl Parser for OrdersParser {
                 continue;
             }
 
-            match serde_json::from_slice::<NodeOrderBatch>(&line) {
-                Ok(batch) => {
-                    for book_diff in batch.events {
-                        records.push(node_book_diff_to_record(
-                            book_diff,
-                            Some(batch.block_number),
-                        )?);
-                    }
+            if let Ok(batch) = serde_json::from_slice::<NodeOrderBatch>(&line) {
+                for event in batch.events {
+                    records.push(order_status_to_record(
+                        event,
+                        Some(batch.block_number),
+                        batch.block_time.as_deref(),
+                    )?);
+                }
+                continue;
+            }
+
+            match serde_json::from_slice::<NodeOrderStatus>(&line) {
+                Ok(event) => {
+                    records.push(order_status_to_record(event, None, None)?);
                 }
                 Err(err) => {
                     warn!(
                         error = %err,
                         line_idx,
                         preview = %line_preview(&line, LINE_PREVIEW_LIMIT),
-                        "skipping unrecognized order book diff line format"
+                        "skipping unrecognized order status line format"
                     );
                 }
             }
@@ -84,60 +122,125 @@ impl Parser for OrdersParser {
     }
 }
 
-fn node_book_diff_to_record(
-    book_diff: NodeBookDiff,
+fn order_status_to_record(
+    event: NodeOrderStatus,
     block_height: Option<u64>,
+    block_time: Option<&str>,
 ) -> Result<DataRecord> {
-    let NodeBookDiff {
+    let NodeOrderStatus {
         user,
-        oid,
-        coin,
-        side,
-        px,
-        raw_book_diff,
-    } = book_diff;
+        hash,
+        builder,
+        time,
+        status,
+    } = event;
 
-    // Extract size from raw_book_diff
-    let sz = extract_size_from_book_diff(&raw_book_diff);
+    // System-generated order updates surface as zero-hash entries; skip them for tx metadata.
+    let tx_hash = hash.as_deref().and_then(normalize_tx_hash);
+    let flattened_order = extract_order_fields(&status);
 
-    let partition_key = format!("{user}-{coin}-{oid}");
-
-    let order = Order {
-        coin,
-        side,
-        limit_px: px,
-        sz,
-        oid,
-        user,
-        book_diff: raw_book_diff,
+    let order_record = OrderStatusRecord {
+        user: user.clone(),
+        hash: hash.clone(),
+        builder,
+        time: time.clone(),
+        status: Some(status.clone()),
+        coin: flattened_order.coin.clone(),
+        side: flattened_order.side.clone(),
+        limit_px: flattened_order.limit_px.clone(),
+        sz: flattened_order.sz.clone(),
+        oid: flattened_order.oid.clone(),
     };
 
     let payload =
-        serde_json::to_vec(&order).context("failed to encode order payload to JSON")?;
+        serde_json::to_vec(&order_record).context("failed to encode order payload to JSON")?;
+
+    let timestamp = time
+        .as_deref()
+        .and_then(parse_iso8601_to_millis)
+        .or_else(|| block_time.and_then(parse_iso8601_to_millis))
+        .unwrap_or(0);
+
+    let (coin, oid) = extract_order_identity(&status);
+    let partition_key = format!(
+        "{}-{}-{}",
+        partition_key_or_unknown(&user),
+        partition_key_or_unknown(&coin),
+        partition_key_or_unknown(&oid)
+    );
 
     Ok(DataRecord {
         block_height,
-        tx_hash: None,
-        timestamp: 0, // Order book diffs don't have timestamps
+        tx_hash,
+        timestamp,
         topic: "hl.orders".to_string(),
         partition_key,
         payload,
     })
 }
 
-fn extract_size_from_book_diff(book_diff: &Value) -> String {
-    // Try to extract sz from {"new": {"sz": "..."}} or {"change": {"sz": "..."}}
-    if let Value::Object(map) = book_diff {
-        if let Some(Value::Object(inner)) = map.get("new").or_else(|| map.get("change")) {
-            if let Some(Value::String(sz)) = inner.get("sz") {
-                return sz.clone();
-            }
+fn extract_order_identity(status: &Value) -> (String, String) {
+    if let Some(order_value) = status
+        .as_object()
+        .and_then(|map| map.get("order"))
+        .or_else(|| status.get("order"))
+    {
+        if let Some(order) = order_value.as_object() {
+            let coin = order
+                .get("coin")
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .to_string();
+            let oid = order
+                .get("oid")
+                .and_then(value_to_string)
+                .unwrap_or_default();
+            return (coin, oid);
         }
     }
-    "0.0".to_string()
+    (String::new(), String::new())
 }
 
-fn deserialize_node_book_diffs<'de, D>(deserializer: D) -> Result<Vec<NodeBookDiff>, D::Error>
+fn extract_order_fields(status: &Value) -> OrderFieldValues {
+    let order_object = status
+        .as_object()
+        .and_then(|obj| obj.get("order").and_then(Value::as_object))
+        .or_else(|| status.as_object());
+
+    let mut values = OrderFieldValues::default();
+    if let Some(order) = order_object {
+        values.coin = order.get("coin").and_then(value_to_string);
+        values.side = order.get("side").and_then(value_to_string);
+        values.limit_px = order
+            .get("limitPx")
+            .or_else(|| order.get("limit_px"))
+            .and_then(value_to_string);
+        values.sz = order.get("sz").and_then(value_to_string);
+        values.oid = order.get("oid").cloned();
+    }
+    values
+}
+
+fn value_to_string(value: &Value) -> Option<String> {
+    match value {
+        Value::String(s) => {
+            if s.trim().is_empty() {
+                None
+            } else {
+                Some(s.to_string())
+            }
+        }
+        Value::Number(num) => num
+            .as_u64()
+            .map(|value| value.to_string())
+            .or_else(|| num.as_i64().map(|value| value.to_string()))
+            .or_else(|| num.as_f64().map(|value| value.to_string())),
+        Value::Bool(b) => Some(b.to_string()),
+        _ => None,
+    }
+}
+
+fn deserialize_node_order_events<'de, D>(deserializer: D) -> Result<Vec<NodeOrderStatus>, D::Error>
 where
     D: serde::Deserializer<'de>,
 {
@@ -153,11 +256,33 @@ where
             .map(|(_, item)| serde_json::from_value(item).map_err(serde::de::Error::custom))
             .collect(),
         Some(other) => Err(serde::de::Error::custom(format!(
-            "expected events array or object, got {other:?}"
+            "expected events list or object, got {other:?}"
         ))),
     }
 }
 
+fn deserialize_option_string<'de, D>(deserializer: D) -> Result<Option<String>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let value = Option::<Value>::deserialize(deserializer)?;
+    match value {
+        None | Some(Value::Null) => Ok(None),
+        Some(Value::String(s)) => {
+            let trimmed = s.trim();
+            if trimmed.is_empty() {
+                Ok(None)
+            } else {
+                Ok(Some(trimmed.to_string()))
+            }
+        }
+        Some(Value::Number(num)) => Ok(Some(num.to_string())),
+        Some(Value::Bool(b)) => Ok(Some(b.to_string())),
+        Some(other) => Err(serde::de::Error::custom(format!(
+            "expected string, got {other:?}"
+        ))),
+    }
+}
 
 #[cfg(test)]
 mod tests {
@@ -171,11 +296,13 @@ mod tests {
             "events": {
                 "first": {
                     "user": "alice",
-                    "oid": 1,
-                    "coin": "BTC",
-                    "side": "bid",
-                    "px": "100.0",
-                    "raw_book_diff": {"new": {"sz": "0.5"}}
+                    "hash": null,
+                    "status": {
+                        "order": {
+                            "coin": "BTC",
+                            "oid": 42
+                        }
+                    }
                 }
             }
         }
@@ -184,6 +311,5 @@ mod tests {
         let batch: NodeOrderBatch = serde_json::from_str(json).expect("should parse");
         assert_eq!(batch.events.len(), 1);
         assert_eq!(batch.events[0].user, "alice");
-        assert_eq!(batch.events[0].coin, "BTC");
     }
 }

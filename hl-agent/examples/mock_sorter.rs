@@ -18,8 +18,8 @@ use std::time::Duration;
 use prost::Message;
 use serde::Serialize;
 use tokio::signal;
-use tonic::{Request, Response, Status};
 use tonic::transport::Server;
+use tonic::{Request, Response, Status};
 use tracing::{debug, error, info, warn};
 
 pub mod proto {
@@ -243,9 +243,7 @@ impl StatsTracker {
             let mut per_topic_map = self.unique_tx_per_topic.lock().unwrap();
             let mut duplicates = 0;
             for (topic, tx_hash) in topic_tx_pairs {
-                let topic_set = per_topic_map
-                    .entry(topic)
-                    .or_insert_with(HashSet::new);
+                let topic_set = per_topic_map.entry(topic).or_default();
                 if !topic_set.insert(tx_hash) {
                     // Same tx_hash appeared twice in the SAME topic
                     duplicates += 1;
@@ -318,8 +316,7 @@ impl RecordWriter {
         let filename = format!("batch-{idx}.json");
         let path = self.dir.join(filename);
         let snapshot = BatchSnapshot::from_batch(batch);
-        let data = serde_json::to_vec_pretty(&snapshot)
-            .map_err(|err| io::Error::new(io::ErrorKind::Other, err))?;
+        let data = serde_json::to_vec_pretty(&snapshot).map_err(io::Error::other)?;
         tokio::fs::write(path, data).await
     }
 }
@@ -375,6 +372,7 @@ impl BatchSnapshot {
 }
 
 #[derive(Debug)]
+#[allow(clippy::enum_variant_names)] // Keeping descriptive Missing* variants is clearer at call sites.
 enum ValidationError {
     MissingTopic,
     MissingPartitionKey,
@@ -524,8 +522,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     info!(%addr, "mock sorter listening");
 
+    // Increase gRPC message size limits to handle large batches
+    // Default: 4MB, Increased to: 100MB
+    const MAX_MESSAGE_SIZE: usize = 100 * 1024 * 1024; // 100 MB
+
     Server::builder()
-        .add_service(SorterServiceServer::new(sorter))
+        .add_service(
+            SorterServiceServer::new(sorter)
+                .max_encoding_message_size(MAX_MESSAGE_SIZE)
+                .max_decoding_message_size(MAX_MESSAGE_SIZE),
+        )
         .serve_with_shutdown(addr, shutdown_signal())
         .await?;
 

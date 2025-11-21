@@ -1,5 +1,6 @@
 use crate::parsers::{
-    drain_complete_lines, line_preview, parse_iso8601_to_millis, trim_line_bytes, Parser,
+    drain_complete_lines, line_preview, normalize_tx_hash, parse_iso8601_to_millis,
+    trim_line_bytes, Parser,
 };
 use crate::sorter_client::proto::DataRecord;
 use anyhow::{Context, Result};
@@ -10,6 +11,10 @@ use tracing::warn;
 
 const LINE_PREVIEW_LIMIT: usize = 256;
 
+/// Converts miscellaneous JSON events into the `hl.misc_events` stream.
+///
+/// The parser expects the `node_misc_events` batch format, extracts user identifiers when
+/// available, and serializes a compact payload `{time, hash, inner}` for sorter.
 #[derive(Default)]
 pub struct MiscEventsParser {
     buffer: Vec<u8>,
@@ -75,16 +80,21 @@ impl Parser for MiscEventsParser {
     }
 }
 
-fn node_misc_event_to_record(
-    event: RawMiscEvent,
-    block_height: Option<u64>,
-) -> Result<DataRecord> {
-    let user = extract_user_from_payload(&event.payload);
+fn node_misc_event_to_record(event: RawMiscEvent, block_height: Option<u64>) -> Result<DataRecord> {
+    let RawMiscEvent {
+        time,
+        hash,
+        mut payload,
+    } = event;
+    let user = extract_user_from_payload(&payload);
+    let inner_value = payload
+        .remove("inner")
+        .unwrap_or_else(|| Value::Object(payload.clone()));
 
     let event = MiscEvent {
-        time: event.time.clone(),
-        hash: event.hash.clone(),
-        inner: Value::Object(event.payload),
+        time,
+        hash,
+        inner: inner_value,
     };
 
     let partition_key = if user.is_empty() {
@@ -101,11 +111,8 @@ fn node_misc_event_to_record(
 
     Ok(DataRecord {
         block_height,
-        tx_hash: if event.hash.is_empty() {
-            None
-        } else {
-            Some(event.hash)
-        },
+        // Zero-hash misc events are emitted by system modules; drop their hashes for tx metadata.
+        tx_hash: normalize_tx_hash(&event.hash),
         timestamp,
         topic: "hl.misc_events".to_string(),
         partition_key,

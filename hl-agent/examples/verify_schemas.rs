@@ -3,8 +3,8 @@
 //! Usage: cargo run --example verify_schemas
 
 use hl_agent::parsers::{
-    BlocksParser, FillsParser, MiscEventsParser, OrdersParser, TradesParser, TransactionsParser,
-    Parser,
+    BlocksParser, FillsParser, MiscEventsParser, OrdersParser, Parser, TradesParser,
+    TransactionsParser,
 };
 use serde_json::Value;
 use std::collections::HashMap;
@@ -16,14 +16,14 @@ use std::path::{Path, PathBuf};
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("=== Schema Compliance Verification ===\n");
 
-    let mut summary = Vec::new();
-
-    summary.push(("Blocks", verify_blocks_schema()?));
-    summary.push(("Transactions", verify_transactions_schema()?));
-    summary.push(("Trades", verify_trades_schema()?));
-    summary.push(("Fills", verify_fills_schema()?));
-    summary.push(("Orders", verify_orders_schema()?));
-    summary.push(("Misc events", verify_misc_events_schema()?));
+    let summary = vec![
+        ("Blocks", verify_blocks_schema()?),
+        ("Transactions", verify_transactions_schema()?),
+        ("Trades", verify_trades_schema()?),
+        ("Fills", verify_fills_schema()?),
+        ("Orders", verify_orders_schema()?),
+        ("Misc events", verify_misc_events_schema()?),
+    ];
 
     println!("\n=== Verification Summary ===");
     for (name, status) in &summary {
@@ -138,7 +138,9 @@ fn verify_transactions_schema() -> Result<SchemaStatus, Box<dyn std::error::Erro
 
 fn verify_trades_schema() -> Result<SchemaStatus, Box<dyn std::error::Error>> {
     println!("📊 Trades Schema Verification");
-    println!("Expected fields: coin, side, px, sz, time (number), hash, tid (number), users (array)");
+    println!(
+        "Expected fields: coin, side, px, sz, time (number), hash, tid (number), users (array)"
+    );
 
     let sample_data = match read_sample_data(&[
         "/home/bytenoob/hl-data/node_trades/hourly/test_trades.jsonl",
@@ -187,7 +189,9 @@ fn verify_trades_schema() -> Result<SchemaStatus, Box<dyn std::error::Error>> {
 
 fn verify_fills_schema() -> Result<SchemaStatus, Box<dyn std::error::Error>> {
     println!("💰 Fills Schema Verification");
-    println!("Expected fields: hash (string), crossed (bool), tid (number), liquidation (object|null)");
+    println!(
+        "Expected fields: hash (string), crossed (bool), tid (number), liquidation (object|null)"
+    );
 
     let sample_data = match read_sample_data(&[
         "/home/bytenoob/hl-data/node_fills_by_block/hourly/20251107",
@@ -259,7 +263,9 @@ fn verify_orders_schema() -> Result<SchemaStatus, Box<dyn std::error::Error>> {
 
 fn verify_misc_events_schema() -> Result<SchemaStatus, Box<dyn std::error::Error>> {
     println!("🔔 Misc Events Schema Verification");
-    println!("Expected fields: time (ISO string), hash (string), inner (object with event type key)");
+    println!(
+        "Expected fields: time (ISO string), hash (string), inner (object with event type key)"
+    );
 
     let sample_data = match read_sample_data(&[
         "/home/bytenoob/hl-data/misc_events_by_block/hourly",
@@ -326,11 +332,12 @@ fn check_field(
     };
 
     if !expected_types.contains(&actual_type) {
-        return Err(format!(
-            "❌ Field '{field_name}' has wrong type: expected {:?}, got {actual_type}",
-            expected_types
-        )
-        .into());
+        return Err(
+            format!(
+                "❌ Field '{field_name}' has wrong type: expected {expected_types:?}, got {actual_type}"
+            )
+            .into(),
+        );
     }
 
     Ok(())
@@ -352,11 +359,7 @@ fn read_sample_data(paths: &[&str]) -> Result<Option<Vec<u8>>, Box<dyn std::erro
             }
             Err(err) => {
                 if err.kind() != io::ErrorKind::NotFound {
-                    println!(
-                        "   ↳ ⚠️  Failed to read {}: {}",
-                        candidate.display(),
-                        err
-                    );
+                    println!("   ↳ ⚠️  Failed to read {}: {}", candidate.display(), err);
                 }
             }
         }
@@ -370,16 +373,11 @@ fn try_read_path(path: &Path) -> io::Result<Vec<u8>> {
             if metadata.is_file() {
                 fs::read(path)
             } else if metadata.is_dir() {
-                let mut entries: Vec<_> = fs::read_dir(path)?
-                    .filter_map(|entry| entry.ok())
-                    .collect();
+                let mut entries: Vec<_> =
+                    fs::read_dir(path)?.filter_map(|entry| entry.ok()).collect();
                 entries.sort_by_key(|entry| entry.file_name());
                 for entry in entries {
-                    if entry
-                        .file_type()
-                        .map(|ty| ty.is_file())
-                        .unwrap_or(false)
-                    {
+                    if entry.file_type().map(|ty| ty.is_file()).unwrap_or(false) {
                         if let Ok(bytes) = fs::read(entry.path()) {
                             return Ok(bytes);
                         }
