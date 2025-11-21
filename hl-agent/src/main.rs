@@ -229,10 +229,24 @@ async fn seed_existing_files(
 ) -> Result<()> {
     let mut existing_files = discover_existing_files(watch_paths)?;
 
+    // Sort by priority first, then by modification time (NEWEST first) to ensure
+    // latest actively-written files are monitored when total files exceed semaphore limit
     existing_files.sort_by(|a, b| {
         let a_priority = file_priority(a.as_path());
         let b_priority = file_priority(b.as_path());
-        a_priority.cmp(&b_priority).then_with(|| a.cmp(b))
+
+        a_priority.cmp(&b_priority).then_with(|| {
+            // Get modification times for both files
+            let a_mtime = std::fs::metadata(a).ok().and_then(|m| m.modified().ok());
+            let b_mtime = std::fs::metadata(b).ok().and_then(|m| m.modified().ok());
+
+            match (a_mtime, b_mtime) {
+                (Some(a_time), Some(b_time)) => b_time.cmp(&a_time), // NEWEST first (reversed)
+                (Some(_), None) => std::cmp::Ordering::Less,  // a has mtime, prefer it
+                (None, Some(_)) => std::cmp::Ordering::Greater, // b has mtime, prefer it
+                (None, None) => a.cmp(b), // fallback to alphabetical
+            }
+        })
     });
 
     info!(
