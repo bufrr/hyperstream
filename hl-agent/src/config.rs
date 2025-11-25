@@ -5,22 +5,54 @@ use std::path::{Path, PathBuf};
 
 #[derive(Debug, Deserialize, Clone)]
 pub struct Config {
+    #[serde(default)]
+    pub mode: SourceMode,
+    #[serde(default)]
     pub node: NodeConfig,
+    #[serde(default)]
     pub watcher: WatcherConfig,
     pub sorter: SorterConfig,
+    #[serde(default)]
     pub checkpoint: CheckpointConfig,
     #[serde(default)]
     pub performance: PerformanceConfig,
+    #[serde(default)]
+    pub explorer_ws: Option<ExplorerWsConfig>,
+}
+
+#[derive(Debug, Deserialize, Clone, Copy, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum SourceMode {
+    File,
+    Websocket,
+}
+
+impl Default for SourceMode {
+    fn default() -> Self {
+        SourceMode::File
+    }
 }
 
 #[derive(Debug, Deserialize, Clone)]
 pub struct NodeConfig {
+    #[serde(default)]
     pub node_id: String,
+    #[serde(default)]
     pub data_dir: String,
+}
+
+impl Default for NodeConfig {
+    fn default() -> Self {
+        Self {
+            node_id: String::new(),
+            data_dir: String::new(),
+        }
+    }
 }
 
 #[derive(Debug, Deserialize, Clone)]
 pub struct WatcherConfig {
+    #[serde(default)]
     pub watch_paths: Vec<String>,
     #[serde(default = "default_poll_interval_ms")]
     pub poll_interval_ms: u64,
@@ -29,6 +61,16 @@ pub struct WatcherConfig {
     /// - false: Process all data from the beginning (use for backfilling)
     #[serde(default = "default_skip_historical")]
     pub skip_historical: bool,
+}
+
+impl Default for WatcherConfig {
+    fn default() -> Self {
+        Self {
+            watch_paths: Vec::new(),
+            poll_interval_ms: DEFAULT_POLL_INTERVAL_MS,
+            skip_historical: DEFAULT_SKIP_HISTORICAL,
+        }
+    }
 }
 
 #[derive(Debug, Deserialize, Clone)]
@@ -43,10 +85,20 @@ pub struct SorterConfig {
 
 #[derive(Debug, Deserialize, Clone)]
 pub struct CheckpointConfig {
+    #[serde(default)]
     pub db_path: String,
     #[allow(dead_code)]
     #[serde(default = "default_update_interval_records")]
     pub update_interval_records: u64,
+}
+
+impl Default for CheckpointConfig {
+    fn default() -> Self {
+        Self {
+            db_path: String::new(),
+            update_interval_records: DEFAULT_UPDATE_INTERVAL_RECORDS,
+        }
+    }
 }
 
 #[derive(Debug, Deserialize, Clone)]
@@ -62,6 +114,14 @@ pub struct PerformanceConfig {
     pub bulk_load_abort_bytes: u64,
 }
 
+#[derive(Debug, Deserialize, Clone)]
+pub struct ExplorerWsConfig {
+    /// Hyperliquid Explorer WebSocket URL (for real-time blocks and transactions)
+    /// Default: wss://rpc.hyperliquid.xyz/ws (mainnet)
+    #[serde(default = "default_explorer_ws_url")]
+    pub url: String,
+}
+
 const DEFAULT_POLL_INTERVAL_MS: u64 = 100;
 const DEFAULT_BATCH_SIZE: usize = 100;
 const DEFAULT_UPDATE_INTERVAL_RECORDS: u64 = 1_000;
@@ -69,6 +129,7 @@ const DEFAULT_SKIP_HISTORICAL: bool = true;
 const DEFAULT_MAX_CONCURRENT_TAILERS: usize = 64;
 const DEFAULT_BULK_LOAD_WARN_BYTES: u64 = 500 * 1024 * 1024; // 500 MiB
 const DEFAULT_BULK_LOAD_ABORT_BYTES: u64 = 1024 * 1024 * 1024; // 1 GiB
+const DEFAULT_EXPLORER_WS_URL: &str = "wss://rpc.hyperliquid.xyz/ws";
 
 fn default_poll_interval_ms() -> u64 {
     DEFAULT_POLL_INTERVAL_MS
@@ -98,6 +159,10 @@ fn default_bulk_load_abort_bytes() -> u64 {
     DEFAULT_BULK_LOAD_ABORT_BYTES
 }
 
+fn default_explorer_ws_url() -> String {
+    DEFAULT_EXPLORER_WS_URL.to_string()
+}
+
 impl Default for PerformanceConfig {
     fn default() -> Self {
         Self {
@@ -112,9 +177,7 @@ impl Config {
     pub fn load(path: impl AsRef<Path>) -> Result<Self> {
         let raw = fs::read_to_string(path.as_ref())?;
         let config: Config = toml::from_str(&raw)?;
-        if config.watcher.watch_paths.is_empty() {
-            anyhow::bail!("watch_paths cannot be empty");
-        }
+
         let has_endpoint = config
             .sorter
             .endpoint
@@ -135,6 +198,29 @@ impl Config {
             }
             (false, false) => {
                 anyhow::bail!("sorter configuration requires either endpoint or output_dir")
+            }
+        }
+
+        if config.node.node_id.trim().is_empty() {
+            anyhow::bail!("node.node_id cannot be empty");
+        }
+
+        match config.mode {
+            SourceMode::File => {
+                if config.node.data_dir.trim().is_empty() {
+                    anyhow::bail!("node.data_dir cannot be empty in file mode");
+                }
+                if config.watcher.watch_paths.is_empty() {
+                    anyhow::bail!("watch_paths cannot be empty in file mode");
+                }
+                if config.checkpoint.db_path.trim().is_empty() {
+                    anyhow::bail!("checkpoint.db_path must be set in file mode");
+                }
+            }
+            SourceMode::Websocket => {
+                if config.explorer_ws.is_none() {
+                    anyhow::bail!("explorer_ws configuration is required in websocket mode");
+                }
             }
         }
         Ok(config)

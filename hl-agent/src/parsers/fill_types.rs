@@ -86,6 +86,8 @@ pub(crate) struct NodeFill {
 pub(crate) struct NodeFillBatch {
     #[serde(alias = "blockNumber", alias = "block_height", alias = "blockHeight")]
     pub(crate) block_number: u64,
+    #[serde(default, alias = "round", alias = "height")]
+    pub(crate) _round: Option<u64>,
     #[serde(default)]
     pub(crate) events: Vec<(String, NodeFill)>,
 }

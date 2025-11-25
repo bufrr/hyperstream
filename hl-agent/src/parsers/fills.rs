@@ -16,9 +16,14 @@ const LINE_PREVIEW_LIMIT: usize = 256;
 ///
 /// The parser accepts both single fill lines and aggregated batch lines, buffers partial reads, and
 /// outputs `[user, fill_details]` tuples using the schema sorter expects.
-#[derive(Default)]
 pub struct FillsParser {
     buffer: Vec<u8>,
+}
+
+impl Default for FillsParser {
+    fn default() -> Self {
+        Self { buffer: Vec::new() }
+    }
 }
 
 // Output schema for hl.fills: tuple of [user, fillDetails]
@@ -59,9 +64,10 @@ impl Parser for FillsParser {
 
             match parse_fill_line(&line) {
                 Ok(FillLine::Batch(batch)) => {
+                    let block_number = batch.block_number;
                     for (user, mut fill) in batch.events {
                         fill.user = user;
-                        fill.block_height = Some(batch.block_number);
+                        fill.block_height = Some(block_number);
                         records.push(node_fill_to_record(fill)?);
                     }
                 }

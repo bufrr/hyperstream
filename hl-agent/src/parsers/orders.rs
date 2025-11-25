@@ -15,9 +15,14 @@ const LINE_PREVIEW_LIMIT: usize = 256;
 ///
 /// The parser handles both single-event lines and batch envelopes, normalizes hashes, and flattens
 /// the order fields that downstream consumers expect.
-#[derive(Default)]
 pub struct OrdersParser {
     buffer: Vec<u8>,
+}
+
+impl Default for OrdersParser {
+    fn default() -> Self {
+        Self { buffer: Vec::new() }
+    }
 }
 
 #[derive(Serialize, Default)]
@@ -58,6 +63,8 @@ struct NodeOrderBatch {
     block_number: u64,
     #[serde(alias = "blockTime", alias = "block_time", default)]
     block_time: Option<String>,
+    #[serde(default, alias = "round", alias = "height")]
+    _round: Option<u64>,
     #[serde(default, deserialize_with = "deserialize_node_order_events")]
     events: Vec<NodeOrderStatus>,
 }
@@ -89,10 +96,11 @@ impl Parser for OrdersParser {
             }
 
             if let Ok(batch) = serde_json::from_slice::<NodeOrderBatch>(&line) {
+                let block_number = batch.block_number;
                 for event in batch.events {
                     records.push(order_status_to_record(
                         event,
-                        Some(batch.block_number),
+                        Some(block_number),
                         batch.block_time.as_deref(),
                     )?);
                 }

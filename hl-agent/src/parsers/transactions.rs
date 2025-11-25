@@ -163,7 +163,6 @@ impl TransactionsParser {
             self.proposer_cache.insert(round, proposer);
         }
 
-        // Use round as block_height (no mapping available)
         let block_height = round;
 
         let timestamp = parse_iso8601_to_millis(&time).unwrap_or(0);

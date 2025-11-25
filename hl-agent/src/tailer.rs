@@ -185,30 +185,20 @@ pub async fn tail_file(
                     if had_records {
                         let total_records = records.len();
                         let mut topic_counts: HashMap<String, usize> = HashMap::new();
-                        let mut blocks_count = 0usize;
-                        let mut transactions_count = 0usize;
                         for record in &records {
-                            match record.topic.as_str() {
-                                "hl.blocks" => blocks_count += 1,
-                                "hl.transactions" => transactions_count += 1,
-                                _ => {}
-                            }
                             *topic_counts.entry(record.topic.clone()).or_default() += 1;
                         }
-                        if blocks_count > 0 {
+
+                        // Log all topics at INFO level for visibility
+                        for (topic, count) in &topic_counts {
                             info!(
                                 path = %file_path.display(),
-                                record_count = blocks_count,
-                                "hl.blocks records emitted from parser chunk"
+                                %topic,
+                                record_count = count,
+                                "{} records emitted from parser chunk", topic
                             );
                         }
-                        if transactions_count > 0 {
-                            info!(
-                                path = %file_path.display(),
-                                record_count = transactions_count,
-                                "hl.transactions records emitted from parser chunk"
-                            );
-                        }
+
                         let planned_batches = if batch_size == 0 {
                             1
                         } else {

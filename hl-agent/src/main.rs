@@ -3,15 +3,17 @@ mod config;
 mod output_writer;
 mod parsers;
 mod sorter_client;
+mod sources;
 mod tailer;
 mod watcher;
 
 use anyhow::{Context, Result};
 use checkpoint::CheckpointDB;
-use config::Config;
+use config::{Config, SourceMode};
 use output_writer::{FileWriter, RecordSink};
-use parsers::route_parser;
-use sorter_client::SorterClient;
+use parsers::{route_parser, ExplorerBlocksParser};
+use sorter_client::{proto::DataRecord, SorterClient};
+use sources::explorer_ws::ExplorerWsClient;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -32,44 +34,22 @@ async fn main() -> Result<()> {
         std::env::var("HL_AGENT_CONFIG").unwrap_or_else(|_| "config.toml".to_string());
     let config = Config::load(&config_path)
         .with_context(|| format!("failed to load config from {config_path}"))?;
-    let batch_size = resolve_batch_size(config.sorter.batch_size);
 
+    match config.mode {
+        SourceMode::File => run_file_mode(&config).await,
+        SourceMode::Websocket => run_websocket_mode(&config).await,
+    }
+}
+
+async fn run_file_mode(config: &Config) -> Result<()> {
+    info!("hl-agent starting in file mode");
+
+    let batch_size = resolve_batch_size(config.sorter.batch_size);
     let watch_paths = config.watch_paths();
     let poll_interval = Duration::from_millis(config.watcher.poll_interval_ms);
     let startup_time = SystemTime::now();
     let checkpoint_db = Arc::new(CheckpointDB::new(config.checkpoint_db_path())?);
-    let record_sink: Arc<dyn RecordSink> = if let Some(endpoint) = config.sorter.endpoint.clone() {
-        let mut sorter_client =
-            SorterClient::connect(endpoint.clone(), config.node.node_id.clone())
-                .await
-                .context("failed to connect to sorter endpoint")?;
-
-        let agent_id = sorter_client.agent_id().to_string();
-        let batch_sender = sorter_client
-            .start_stream()
-            .await
-            .context("failed to establish sorter stream")?;
-
-        info!(
-            endpoint = %endpoint,
-            agent_id = %agent_id,
-            "connected to sorter"
-        );
-
-        Arc::new(batch_sender)
-    } else {
-        let output_dir = config
-            .sorter
-            .output_dir_path()
-            .expect("configuration validation ensures output_dir is set");
-
-        info!(
-            output_dir = %output_dir.display(),
-            "configured local file output sink"
-        );
-
-        Arc::new(FileWriter::new(output_dir))
-    };
+    let record_sink = build_record_sink(config).await?;
 
     let (event_tx, mut event_rx) = mpsc::unbounded_channel();
 
@@ -167,6 +147,153 @@ async fn main() -> Result<()> {
     watcher_handle.abort();
 
     Ok(())
+}
+
+async fn run_websocket_mode(config: &Config) -> Result<()> {
+    info!("hl-agent starting in WebSocket mode");
+
+    let ws_config = config
+        .explorer_ws
+        .as_ref()
+        .context("explorer_ws configuration missing for WebSocket mode")?;
+    info!(explorer_ws_url = %ws_config.url, "Explorer WebSocket configuration");
+
+    let batch_size = resolve_batch_size(config.sorter.batch_size);
+    let record_sink = build_record_sink(config).await?;
+
+    // Channel for blocks from WebSocket
+    let (block_tx, mut block_rx) = mpsc::channel(1000);
+
+    // Spawn WebSocket client
+    let ws_url = ws_config.url.clone();
+    let ws_handle = tokio::spawn(async move {
+        let client = ExplorerWsClient::new(ws_url).with_blocks(block_tx);
+
+        if let Err(err) = client.run().await {
+            error!(error = %err, "WebSocket client error");
+        }
+    });
+
+    let block_parser = ExplorerBlocksParser::new();
+    let mut record_buffer: Vec<DataRecord> = Vec::with_capacity(batch_size);
+    let mut offset_counter: u64 = 0;
+    let source_path = "explorer_ws::blocks".to_string();
+
+    info!("hl-agent ready; streaming blocks via WebSocket");
+
+    loop {
+        tokio::select! {
+            maybe_block = block_rx.recv() => {
+                match maybe_block {
+                    Some(block) => {
+                        match block_parser.parse_block(block) {
+                            Ok(record) => {
+                                record_buffer.push(record);
+                                if record_buffer.len() >= batch_size {
+                                    flush_ws_batch(
+                                        record_sink.clone(),
+                                        &source_path,
+                                        &mut offset_counter,
+                                        &mut record_buffer,
+                                    ).await?;
+                                }
+                            }
+                            Err(err) => {
+                                error!(error = %err, "failed to parse block from WebSocket");
+                            }
+                        }
+                    }
+                    None => {
+                        warn!("WebSocket block channel closed; shutting down");
+                        break;
+                    }
+                }
+            }
+            result = tokio::signal::ctrl_c() => {
+                if let Err(err) = result {
+                    error!(error = %err, "failed while waiting for shutdown signal");
+                }
+                info!("shutdown signal received");
+                break;
+            }
+        }
+    }
+
+    if !record_buffer.is_empty() {
+        info!(count = record_buffer.len(), "flushing remaining WebSocket records");
+        flush_ws_batch(
+            record_sink.clone(),
+            &source_path,
+            &mut offset_counter,
+            &mut record_buffer,
+        )
+        .await?;
+    }
+
+    ws_handle.abort();
+    info!("hl-agent stopped");
+
+    Ok(())
+}
+
+async fn build_record_sink(config: &Config) -> Result<Arc<dyn RecordSink>> {
+    if let Some(endpoint) = config
+        .sorter
+        .endpoint
+        .as_ref()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+    {
+        let mut sorter_client =
+            SorterClient::connect(endpoint.clone(), config.node.node_id.clone())
+                .await
+                .context("failed to connect to sorter endpoint")?;
+
+        let agent_id = sorter_client.agent_id().to_string();
+        let batch_sender = sorter_client
+            .start_stream()
+            .await
+            .context("failed to establish sorter stream")?;
+
+        info!(
+            endpoint = %endpoint,
+            agent_id = %agent_id,
+            "connected to sorter"
+        );
+
+        Ok(Arc::new(batch_sender))
+    } else {
+        let output_dir = config
+            .sorter
+            .output_dir_path()
+            .expect("configuration validation ensures output_dir is set");
+
+        info!(
+            output_dir = %output_dir.display(),
+            "configured local file output sink"
+        );
+
+        Ok(Arc::new(FileWriter::new(output_dir)))
+    }
+}
+
+async fn flush_ws_batch(
+    record_sink: Arc<dyn RecordSink>,
+    source_path: &str,
+    offset_counter: &mut u64,
+    record_buffer: &mut Vec<DataRecord>,
+) -> Result<()> {
+    if record_buffer.is_empty() {
+        return Ok(());
+    }
+
+    let batch_offset = *offset_counter;
+    *offset_counter += record_buffer.len() as u64;
+    let records: Vec<DataRecord> = record_buffer.drain(..).collect();
+
+    record_sink
+        .send_batch(source_path.to_string(), batch_offset, records)
+        .await
 }
 
 fn resolve_batch_size(configured: usize) -> usize {

@@ -43,7 +43,7 @@ impl Default for BlocksParser {
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
 struct BlockRecord {
-    height: u64, // Using round as height (no mapping available)
+    height: u64,
     block_time: u64,
     hash: String, // Always empty (not available in replica_cmds)
     proposer: String,
@@ -95,7 +95,7 @@ impl crate::parsers::Parser for BlocksParser {
                                 .insert(block.round, block.proposer.clone());
                         }
 
-                        if let Some(record) = abci_block_to_record(block) {
+                        if let Some(record) = self.abci_block_to_record(block) {
                             match block_record_to_data_record(record) {
                                 Ok(data_record) => records.push(data_record),
                                 Err(err) => {
@@ -125,25 +125,6 @@ impl crate::parsers::Parser for BlocksParser {
     }
 }
 
-fn abci_block_to_record(block: ReplicaAbciBlock) -> Option<BlockRecord> {
-    if block.round == 0 {
-        return None;
-    }
-
-    let timestamp = parse_abci_block_time(&block.time);
-    let num_txs = block.signed_action_bundles.len() as u64;
-
-    // Use round as height since we don't have height mapping
-    Some(BlockRecord {
-        height: block.round,
-        block_time: timestamp,
-        hash: String::new(), // Not available in replica_cmds
-        proposer: block.proposer,
-        num_txs,
-        round: block.round,
-    })
-}
-
 fn block_record_to_data_record(block_payload: BlockRecord) -> Result<DataRecord> {
     let block_height = block_payload.height;
     let timestamp = block_payload.block_time;
@@ -171,5 +152,26 @@ fn parse_abci_block_time(time: &str) -> u64 {
             warn!(%time, "failed to parse abci_block time");
             0
         }
+    }
+}
+
+impl BlocksParser {
+    fn abci_block_to_record(&self, block: ReplicaAbciBlock) -> Option<BlockRecord> {
+        if block.round == 0 {
+            return None;
+        }
+
+        let timestamp = parse_abci_block_time(&block.time);
+        let num_txs = block.signed_action_bundles.len() as u64;
+        let height = block.round;
+
+        Some(BlockRecord {
+            height,
+            block_time: timestamp,
+            hash: String::new(), // Not available in replica_cmds
+            proposer: block.proposer,
+            num_txs,
+            round: block.round,
+        })
     }
 }

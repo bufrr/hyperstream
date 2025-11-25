@@ -1,76 +1,70 @@
 # hl-agent configuration example
-# Copy this file to config.toml and customize for your deployment
+# Copy this file to config.toml and customize for your deployment.
+
+# Source selection: "file" (default) tails Hyperliquid node files.
+# Set to "websocket" to stream explorerBlock data from the Explorer WS.
+mode = "file"
 
 [node]
-# Unique identifier for this agent instance
+# Unique identifier for this agent instance (used in sorter metadata)
 node_id = "hl-agent-1"
 
-# Path to Hyperliquid node data directory
-# Supports tilde (~) expansion
+# Path to Hyperliquid node data directory (supports ~ expansion)
 data_dir = "~/hl-data"
 
 [watcher]
-# Paths to watch for new files (relative to data_dir or absolute)
-# These correspond to Hyperliquid's L1 data output directories
-# NOTE: The watcher uses recursive mode, so specifying parent directories
-#       will automatically detect files in all subdirectories (e.g., date-based dirs)
+# Paths to watch for new files (relative to node.data_dir or absolute).
+# These correspond to Hyperliquid's output directories.
 watch_paths = [
-    "replica_cmds",                    # Blocks + Transactions (JSONL in timestamp dirs like 2025-11-07T*/)
+    "replica_cmds",                    # Blocks + transactions
     "node_trades",                     # Trade data
-    "node_fills_by_block",            # Fill data (batch format) - produces fills + trades
+    "node_fills_by_block",            # Fill data (produces fills + trades)
     "node_order_statuses_by_block",   # Order status data
-    "misc_events_by_block"            # Miscellaneous events (use _by_block variant)
+    "misc_events_by_block"            # Miscellaneous node events
 ]
 
 # Polling interval in milliseconds (default: 100)
 poll_interval_ms = 100
 
 # Skip historical data and only process new data after startup (default: true)
-# - true: Start from end of existing files (RECOMMENDED for production)
-#         Prevents OOM crashes when starting with 100s of GB of historical data
-# - false: Process all historical data from the beginning (use for backfilling)
-#
-# IMPORTANT: When deploying with many existing files, keep this as 'true' to avoid
-#            processing hundreds of GB on first startup which causes memory exhaustion.
+# - true : Start tailing from the end of existing files (prevents OOM on first boot)
+# - false: Reprocess all historical data (useful for manual backfills)
 skip_historical = true
 
 [sorter]
-# Choose ONE of the following output modes:
-
-# Option 1: gRPC mode - Send data to sorter server
-# endpoint = "http://sorter-host:50051"
-
-# Option 2: File output mode - Write JSON files locally (for deployment without sorter)
-output_dir = "/var/lib/hl-agent/output"
+# Choose ONE output mode:
+# 1) gRPC sorter:
+endpoint = "http://127.0.0.1:50051"
+# 2) Local file output (uncomment instead of endpoint):
+# output_dir = "/var/lib/hl-agent/output"
 
 # Batch size for sending records (default: 100)
 batch_size = 100
 
 [checkpoint]
-# Path to SQLite checkpoint database
-# Tracks file offsets for crash recovery
-# Supports tilde (~) expansion
+# SQLite checkpoint database used for crash recovery
+# (Tracks per-file offsets so processing resumes where it left off)
 db_path = "~/.hl-agent/checkpoint.db"
 
-# Update frequency (records between checkpoints)
-# Default: 1000
+# Optional: how often to persist checkpoints (records between updates)
 # update_interval_records = 1000
 
 [performance]
-# Performance tuning parameters
-# These settings control resource limits and memory usage
-
 # Maximum number of concurrent file tailer tasks (default: 64)
-# Increase on high-end servers with many CPU cores and file descriptors
-# Decrease on resource-constrained environments
 # max_concurrent_tailers = 64
 
-# Bulk loading thresholds for MessagePack files (periodic_abci_states)
-# These prevent OOM when processing large block files
-
-# Warn when bulk-loading files exceed this size (default: 524288000 = 500 MiB)
+# Warn/abort thresholds for large MessagePack files (defaults: 500 MiB / 1 GiB)
 # bulk_load_warn_bytes = 524288000
-
-# Abort bulk-loading when files exceed this size (default: 1073741824 = 1 GiB)
-# If your block files exceed this, consider switching to streaming MessagePack parsing
 # bulk_load_abort_bytes = 1073741824
+
+# ------------------------------------------------------------------------------
+# Optional WebSocket mode
+# ------------------------------------------------------------------------------
+# To stream hl.blocks directly from the Hyperliquid Explorer WebSocket:
+#   1. Set `mode = "websocket"` above.
+#   2. Configure the endpoint below (omit if using the default mainnet URL).
+#
+# [explorer_ws]
+# # Mainnet: wss://rpc.hyperliquid.xyz/ws
+# # Testnet: wss://api.hyperliquid-testnet.xyz/ws
+# url = "wss://rpc.hyperliquid.xyz/ws"
