@@ -94,7 +94,7 @@ impl FileWriter {
 
         let mut buffer = Vec::new();
         for record in records {
-            trace!(topic = %record.topic, partition_key = %record.partition_key, "encoding record for batch");
+            trace!(topic = %record.topic, "encoding record for batch");
             let persisted = PersistedRecord {
                 file_path: source_file_path.to_string(),
                 byte_offset,
@@ -102,7 +102,6 @@ impl FileWriter {
                 tx_hash: record.tx_hash.clone(),
                 timestamp: record.timestamp,
                 topic: record.topic.clone(),
-                partition_key: record.partition_key.clone(),
                 payload: Self::payload_to_json(&record.payload),
             };
 
@@ -190,6 +189,5 @@ struct PersistedRecord {
     tx_hash: Option<String>,
     timestamp: u64,
     topic: String,
-    partition_key: String,
     payload: Value,
 }

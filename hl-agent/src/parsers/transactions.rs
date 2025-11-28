@@ -1,8 +1,8 @@
 use crate::parsers::blocks::{proposer_cache, SharedProposerCache};
 use crate::parsers::utils::extract_starting_block;
 use crate::parsers::{
-    drain_complete_lines, line_preview, parse_iso8601_to_millis, partition_key_or_unknown,
-    trim_line_bytes, Parser, LINE_PREVIEW_LIMIT,
+    drain_complete_lines, line_preview, parse_iso8601_to_millis, trim_line_bytes, Parser,
+    LINE_PREVIEW_LIMIT,
 };
 use crate::sorter_client::proto::DataRecord;
 use anyhow::{Context, Result};
@@ -280,7 +280,6 @@ fn transaction_to_data_record(mut tx: TransactionRecord, block_height: u64) -> R
         tx_hash: metadata_hash,
         timestamp: tx.time,
         topic: "hl.transactions".to_string(),
-        partition_key: partition_key_or_unknown(&tx.user),
         payload,
     })
 }

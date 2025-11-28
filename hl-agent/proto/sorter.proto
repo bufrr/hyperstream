@@ -34,10 +34,9 @@ message DataRecord {
   optional string tx_hash = 2;       // For deduplication
   uint64 timestamp = 3;              // Unix milliseconds
 
-  // Kafka routing (sorter will use these)
+  // Kafka routing
   string topic = 4;            // e.g., "hl.blocks", "hl.trades"
-  string partition_key = 5;    // e.g., height, coin, user
 
   // Actual payload (JSON or msgpack bytes)
-  bytes payload = 6;
+  bytes payload = 5;
 }

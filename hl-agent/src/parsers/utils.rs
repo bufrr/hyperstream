@@ -5,7 +5,6 @@
 //! - Timestamp parsing (ISO8601)
 //! - Transaction hash normalization
 //! - Flexible deserialization helpers
-//! - Partition key generation
 //! - File path utilities
 //! - System timestamp utilities
 
@@ -100,17 +99,6 @@ pub(crate) fn line_preview(line: &[u8], limit: usize) -> String {
         preview.push(ch);
     }
     preview
-}
-
-/// Returns "unknown" if the input string is empty, otherwise returns the input as-is.
-///
-/// Used for partition keys to ensure valid kafka-style routing even when data is missing.
-pub(crate) fn partition_key_or_unknown(value: &str) -> String {
-    if value.is_empty() {
-        "unknown".to_string()
-    } else {
-        value.to_string()
-    }
 }
 
 /// Flexible deserializer that accepts both strings and numbers.

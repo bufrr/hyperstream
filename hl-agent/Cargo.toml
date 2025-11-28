@@ -7,6 +7,14 @@ edition = "2021"
 name = "hl_agent"
 path = "src/lib.rs"
 
+[[bin]]
+name = "hl-agent"
+path = "src/main.rs"
+
+[[bin]]
+name = "ws-agent"
+path = "src/bin/ws_agent.rs"
+
 [dependencies]
 anyhow = "1"
 notify = "8"

@@ -20,7 +20,7 @@ use serde::Serialize;
 use tokio::signal;
 use tonic::transport::Server;
 use tonic::{Request, Response, Status};
-use tracing::{debug, error, info, warn};
+use tracing::{error, info, warn};
 
 pub mod proto {
     tonic::include_proto!("hyperstream");
@@ -299,7 +299,6 @@ struct RecordSnapshot {
     tx_hash: Option<String>,
     timestamp_ms: u64,
     topic: String,
-    partition_key: String,
     payload_hex: String,
 }
 
@@ -320,7 +319,6 @@ impl BatchSnapshot {
                 tx_hash: record.tx_hash.clone(),
                 timestamp_ms: record.timestamp,
                 topic: record.topic.clone(),
-                partition_key: record.partition_key.clone(),
                 payload_hex: to_hex(&record.payload),
             })
             .collect();
@@ -333,7 +331,6 @@ impl BatchSnapshot {
 #[allow(clippy::enum_variant_names)] // Keeping descriptive Missing* variants is clearer at call sites.
 enum ValidationError {
     MissingTopic,
-    MissingPartitionKey,
     MissingPayload,
     MissingTimestamp,
 }
@@ -342,7 +339,6 @@ impl fmt::Display for ValidationError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             ValidationError::MissingTopic => write!(f, "missing topic"),
-            ValidationError::MissingPartitionKey => write!(f, "missing partition_key"),
             ValidationError::MissingPayload => write!(f, "missing payload"),
             ValidationError::MissingTimestamp => write!(f, "missing timestamp"),
         }
@@ -355,9 +351,6 @@ fn validate_record(record: &DataRecord) -> Result<(), ValidationError> {
     }
     if record.topic.trim().is_empty() {
         return Err(ValidationError::MissingTopic);
-    }
-    if record.partition_key.trim().is_empty() {
-        return Err(ValidationError::MissingPartitionKey);
     }
     if record.payload.is_empty() {
         return Err(ValidationError::MissingPayload);

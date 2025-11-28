@@ -228,7 +228,84 @@ build_project() {
         exit 1
     fi
 
+    if [ ! -f "target/release/ws-agent" ]; then
+        log_warning "ws-agent binary not found - WebSocket agent tests will be skipped"
+    fi
+
     log_success "Binaries ready"
+}
+
+run_ws_agent_briefly() {
+    log_step "Running WebSocket Agent (ws-agent)"
+
+    if [ ! -f "target/release/ws-agent" ]; then
+        log_warning "ws-agent not found - skipping"
+        return
+    fi
+
+    # Check if Redis is available
+    if ! command -v redis-cli &> /dev/null; then
+        log_warning "redis-cli not found - skipping ws-agent test"
+        return
+    fi
+
+    if ! redis-cli ping &> /dev/null; then
+        log_warning "Redis not running - skipping ws-agent test"
+        return
+    fi
+
+    log_info "Starting ws-agent to stream blocks from Hyperliquid Explorer WebSocket..."
+    log_info "ws-agent will connect to wss://rpc.hyperliquid.xyz/ws and store blocks in Redis"
+
+    # Run ws-agent for 10 seconds to verify it connects and receives blocks
+    local ws_log="${TEST_DIR}/ws-agent.log"
+    timeout 10 ./target/release/ws-agent > "${ws_log}" 2>&1 &
+    local ws_pid=$!
+
+    log_info "ws-agent started (PID: $ws_pid), waiting 10 seconds..."
+    sleep 10
+
+    # Check if ws-agent ran successfully (it should have received some blocks)
+    if wait $ws_pid 2>/dev/null; then
+        log_info "ws-agent completed (timeout reached)"
+    fi
+
+    # Check if blocks were stored in Redis
+    local block_count=$(redis-cli keys "block:*" 2>/dev/null | wc -l)
+    if [ "$block_count" -gt 0 ]; then
+        log_success "ws-agent verified: ${block_count} blocks stored in Redis"
+
+        # Show a sample block
+        local sample_key=$(redis-cli keys "block:*" 2>/dev/null | head -1)
+        if [ -n "$sample_key" ]; then
+            log_info "Sample block: $sample_key"
+            redis-cli get "$sample_key" 2>/dev/null | head -c 200
+            echo ""
+        fi
+    else
+        # Check log for any connection errors
+        if grep -q "Connected to Explorer WebSocket" "${ws_log}" 2>/dev/null; then
+            log_success "ws-agent connected to WebSocket (no blocks received yet - may need more time)"
+        elif grep -q "Failed to connect" "${ws_log}" 2>/dev/null; then
+            log_warning "ws-agent failed to connect to WebSocket"
+            tail -10 "${ws_log}"
+        else
+            log_warning "ws-agent status unknown - check ${ws_log}"
+        fi
+    fi
+}
+
+clean_previous_state() {
+    log_step "Cleaning Previous State"
+
+    log_info "Removing mock output directory..."
+    rm -rf "${OUTPUT_DIR}"
+    mkdir -p "${OUTPUT_DIR}"
+
+    log_info "Removing checkpoint database..."
+    rm -f "${CHECKPOINT_DB}"*
+
+    log_success "Previous state cleaned"
 }
 
 start_mock_sorter() {
@@ -375,7 +452,6 @@ for i in range(0, total_batches, sample_interval):
 
                             sample_records[topic] = {
                                 'topic': topic,
-                                'partition_key': record.get('partition_key'),
                                 'has_payload': payload is not None
                             }
         except Exception as e:
@@ -526,7 +602,6 @@ print()
 for topic in sorted(data['sample_records'].keys()):
     sample = data['sample_records'][topic]
     print(f"**{topic}**:")
-    print(f"- Partition Key: `{sample['partition_key']}`")
     print(f"- Payload Decoded: {'✅' if sample['has_payload'] else '❌'}")
     print()
 PYTHON_REPORT
@@ -569,10 +644,11 @@ show_summary() {
 
     echo ""
     if [ -f "${TEST_DIR}/analysis.json" ]; then
-        python3 <<'PYTHON_SUMMARY'
+        ANALYSIS_FILE="${TEST_DIR}/analysis.json" python3 <<'PYTHON_SUMMARY'
 import json
+import os
 
-with open('${TEST_DIR}/analysis.json') as f:
+with open(os.environ['ANALYSIS_FILE']) as f:
     data = json.load(f)
 
 print(f"  Total Batches:    {data['total_batches']:,}")
@@ -619,6 +695,14 @@ main() {
     check_prerequisites
     setup_test_environment
     build_project
+
+    # Step 1: Run ws-agent briefly to verify it works
+    run_ws_agent_briefly
+
+    # Step 2: Clean previous state (mock output + checkpoint)
+    clean_previous_state
+
+    # Step 3: Start mock server and hl-agent
     start_mock_sorter
     start_agent
 

@@ -84,11 +84,7 @@ fn node_misc_event_to_record(event: RawMiscEvent, block_height: Option<u64>) -> 
         inner: inner_value,
     };
 
-    let partition_key = if user.is_empty() {
-        "system".to_string()
-    } else {
-        user.clone()
-    };
+    let _ = user; // User extracted but no longer needed for partition_key
 
     let payload =
         serde_json::to_vec(&event).context("failed to encode misc event payload to JSON")?;
@@ -102,7 +98,6 @@ fn node_misc_event_to_record(event: RawMiscEvent, block_height: Option<u64>) -> 
         tx_hash: normalize_tx_hash(&event.hash),
         timestamp,
         topic: "hl.misc_events".to_string(),
-        partition_key,
         payload,
     })
 }

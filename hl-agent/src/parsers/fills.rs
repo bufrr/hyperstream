@@ -1,8 +1,5 @@
 use super::fill_types::{parse_fill_line, FillLine, NodeFill};
-use crate::parsers::{
-    line_preview, normalize_tx_hash, partition_key_or_unknown, BufferedLineParser, LineParser,
-    LINE_PREVIEW_LIMIT,
-};
+use crate::parsers::{line_preview, normalize_tx_hash, BufferedLineParser, LineParser, LINE_PREVIEW_LIMIT};
 use crate::sorter_client::proto::DataRecord;
 use anyhow::{Context, Result};
 use serde::Serialize;
@@ -111,10 +108,6 @@ fn node_fill_to_record(node_fill: NodeFill) -> Result<DataRecord> {
         liquidation: node_fill.liquidation,
     };
 
-    let user_for_partition = partition_key_or_unknown(&user);
-    let coin_for_partition = partition_key_or_unknown(&fill_details.coin);
-    let partition_key = format!("{user_for_partition}-{coin_for_partition}");
-
     // Serialize as tuple: [user, fillDetails]
     // Allium format: ["0x...", {coin: "ETH", px: "100", ...}]
     let fill_tuple = (user, fill_details);
@@ -126,7 +119,6 @@ fn node_fill_to_record(node_fill: NodeFill) -> Result<DataRecord> {
         tx_hash,
         timestamp,
         topic: "hl.fills".to_string(),
-        partition_key,
         payload,
     })
 }

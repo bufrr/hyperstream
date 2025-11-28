@@ -96,8 +96,7 @@ mod tests {
                 block_height: None,
                 tx_hash: None,
                 timestamp: 0,
-                topic: "test".to_string(),
-                partition_key: format!("{}{}", self.prefix, text),
+                topic: format!("{}{}", self.prefix, text),
                 payload: line.to_vec(),
             }])
         }
@@ -116,8 +115,8 @@ mod tests {
             .expect("should parse");
 
         assert_eq!(records.len(), 2);
-        assert_eq!(records[0].partition_key, "test:line1");
-        assert_eq!(records[1].partition_key, "test:line2");
+        assert_eq!(records[0].topic, "test:line1");
+        assert_eq!(records[1].topic, "test:line2");
     }
 
     #[test]
@@ -139,7 +138,7 @@ mod tests {
             .parse(Path::new("test.txt"), b" line\n")
             .expect("should parse");
         assert_eq!(records.len(), 1);
-        assert_eq!(records[0].partition_key, "partial line");
+        assert_eq!(records[0].topic, "partial line");
         assert_eq!(parser.backlog_len(), 0);
     }
 

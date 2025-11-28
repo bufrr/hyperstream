@@ -1,7 +1,7 @@
 use super::fill_types::{parse_fill_line, FillLine, NodeFill};
 use crate::parsers::{
-    drain_complete_lines, line_preview, normalize_tx_hash, partition_key_or_unknown,
-    trim_line_bytes, Parser, LINE_PREVIEW_LIMIT,
+    drain_complete_lines, line_preview, normalize_tx_hash, trim_line_bytes, Parser,
+    LINE_PREVIEW_LIMIT,
 };
 use crate::sorter_client::proto::DataRecord;
 use anyhow::{Context, Result};
@@ -225,8 +225,6 @@ fn emit_trade_record(
         users,
     };
 
-    let partition_key = partition_key_or_unknown(&trade.coin);
-
     let payload = serde_json::to_vec(&trade).context("failed to encode trade payload to JSON")?;
 
     let block_height = primary
@@ -239,7 +237,6 @@ fn emit_trade_record(
         tx_hash: normalized_hash,
         timestamp: trade.time,
         topic: "hl.trades".to_string(),
-        partition_key,
         payload,
     }))
 }

@@ -40,6 +40,8 @@ This guide documents the complete data streaming pipeline for Hyperliquid blockc
 - **skip_historical Mode**: Process only new data, start from end of files
 - **MessagePack + JSONL Dual Format Support**: blocks use MessagePack, others use JSONL
 - **Redis Hash Lookup**: Block hashes retrieved from Redis (populated by ws-agent)
+- **Line Count Persistence**: Checkpoint tracks `line_count` for accurate block height calculation after restart
+- **Optimized Startup**: Line counting only for `replica_cmds` files; other large files skip immediately
 
 ### Implementation Status
 
@@ -129,14 +131,18 @@ File path: replica_cmds/2025-11-26T04:53:40Z/20251126/808750000
 
 **Line Number and Block Height Formula**:
 ```
-Block Height = Filename + Line Number
+Block Height = Filename + Line Count + 1
 ```
 
-| Line | Block Height | Calculation |
-|------|--------------|-------------|
-| Line 1 | 808750001 | 808750000 + 1 |
-| Line 100 | 808750100 | 808750000 + 100 |
-| Line 10000 | 808760000 | 808750000 + 10000 |
+Where `Line Count` is the 0-indexed line number (first line = line count 0).
+
+| Line Count | Block Height | Calculation |
+|------------|--------------|-------------|
+| 0 (first line) | 808750001 | 808750000 + 0 + 1 |
+| 99 | 808750100 | 808750000 + 99 + 1 |
+| 9999 | 808760000 | 808750000 + 9999 + 1 |
+
+**Important**: The file is named with the starting block, but the first line contains `starting_block + 1`. For example, file `808750000` contains blocks 808750001 to 808760000.
 
 **Round Number vs Block Height**:
 
@@ -172,7 +178,7 @@ Block Height = Filename + Line Number
 **Field Mapping**:
 | Field | Source | Notes |
 |-------|--------|-------|
-| height | **filename + line number** | Not round, calculated block height |
+| height | **filename + line_count + 1** | Not round, calculated block height |
 | time | `abci_block.time` | ISO8601 -> milliseconds |
 | hash | **Redis (ws-agent)** | Retrieved from Redis cache |
 | proposer | `abci_block.proposer` | Block proposer address |
@@ -182,7 +188,7 @@ Block Height = Filename + Line Number
 **Important**: `round` and `height` are different values!
 - `round`: CometBFT internal consensus round number (e.g., 1,087,330,263)
 - `height`: Public blockchain block height (e.g., 808,750,001)
-- Calculation: `height = filename + line number`
+- Calculation: `height = filename + line_count + 1` (line_count is 0-indexed)
 
 **Hash Retrieval**:
 - Block hash retrieved from Redis
@@ -574,21 +580,53 @@ src/
 │   ├── mod.rs              # Shared types and utilities
 │   └── file_mode.rs        # File mode runner
 ├── parsers/
-│   ├── mod.rs              # Parser routing
+│   ├── mod.rs              # Parser routing + Parser trait
 │   ├── batch.rs            # Generic batch wrapper BatchEnvelope<T>
 │   ├── buffered.rs         # Buffered line parser abstraction
 │   ├── schemas.rs          # Shared output schemas (Block, Transaction)
 │   ├── block_merger.rs     # Block hash merger
 │   ├── hash_store.rs       # Redis hash lookup
-│   └── [topic parsers]     # fills, orders, trades, misc_events, etc.
+│   ├── blocks.rs           # BlocksParser (replica_cmds -> hl.blocks)
+│   ├── transactions.rs     # TransactionsParser (replica_cmds -> hl.transactions)
+│   ├── fills.rs            # FillsParser (node_fills_by_block -> hl.fills)
+│   ├── trades.rs           # TradesParser (node_fills_by_block -> hl.trades)
+│   ├── orders.rs           # OrdersParser (node_order_statuses_by_block -> hl.orders)
+│   └── misc_events.rs      # MiscEventsParser (misc_events_by_block -> hl.misc_events)
 ├── config.rs               # Configuration management
-├── checkpoint.rs           # Progress checkpointing
-├── tailer.rs               # File tailer
+├── checkpoint.rs           # Progress checkpointing (with line_count)
+├── tailer.rs               # File tailer + TailerConfig
 ├── watcher.rs              # File system watcher
 ├── sources/
 │   └── mod.rs              # Data sources module
 └── bin/
     └── ws_agent.rs         # WebSocket agent binary
+```
+
+### Key Types
+
+**TailerConfig** (src/tailer.rs):
+```rust
+/// Configuration for file tailers.
+#[derive(Clone)]
+pub struct TailerConfig {
+    pub checkpoint_db: Arc<CheckpointDB>,
+    pub record_sink: Arc<dyn RecordSink>,
+    pub batch_size: usize,
+    pub poll_interval: Duration,
+    pub bulk_load_warn_bytes: u64,
+    pub bulk_load_abort_bytes: u64,
+    pub cancel_token: CancellationToken,
+}
+```
+
+**Parser Trait** (src/parsers/mod.rs):
+```rust
+pub trait Parser: Send {
+    fn parse(&mut self, file_path: &Path, data: &[u8]) -> Result<Vec<DataRecord>>;
+    fn backlog_len(&self) -> usize;
+    fn set_initial_line_count(&mut self, count: u64) {}  // For block height calculation
+    fn get_line_count(&self) -> u64 { 0 }
+}
 ```
 
 ### HashStore Component
@@ -658,14 +696,39 @@ redis_url = "redis://127.0.0.1:6379"
 
 **Database**: SQLite with WAL mode (`~/.hl-agent/checkpoint.db`)
 
+**Schema**:
+```sql
+CREATE TABLE checkpoints (
+    file_path TEXT PRIMARY KEY,
+    byte_offset INTEGER NOT NULL,
+    file_size INTEGER NOT NULL,
+    last_modified_ts INTEGER NOT NULL,
+    updated_at INTEGER NOT NULL,
+    line_count INTEGER NOT NULL DEFAULT 0
+);
+```
+
+**Key Fields**:
+| Field | Purpose |
+|-------|---------|
+| `byte_offset` | Position in file to resume reading |
+| `line_count` | Number of lines processed (critical for block height calculation) |
+
 **Safe Offset Calculation**:
 - Formula: `safe_offset = current_offset + chunk.len() - parser.backlog_len()`
 - Update checkpoint in database to safe_offset
+
+**Line Count Persistence**:
+- `line_count` is persisted for `replica_cmds` files
+- Used to calculate block height: `height = filename + line_count + 1`
+- When `skip_historical=true`, newlines are counted in the skipped portion (only for `replica_cmds`)
+- Other file types don't need `line_count` and skip immediately without counting
 
 **Why Important**:
 - Parser buffer may contain incomplete lines/Batches
 - Checkpoint must point to last **fully processed** byte
 - Resume safely from checkpoint on restart, no data loss
+- `line_count` ensures correct block height calculation after restart
 
 ---
 
@@ -724,7 +787,12 @@ HL_AGENT_CONFIG=config.toml ./target/release/hl-agent
 
 ---
 
-**Document Version**: v9.0
-**Last Updated**: 2025-11-27
+**Document Version**: v10.0
+**Last Updated**: 2025-11-28
 **Status**: Production Ready - All 6 topics verified (file mode + Redis hash lookup)
 **Architecture**: Two-binary system (ws-agent + hl-agent)
+**Recent Changes**:
+- Added `line_count` to checkpoint schema for accurate block height calculation
+- Refactored tailer functions to use `TailerConfig` struct
+- Optimized `skip_historical` to only count lines for `replica_cmds` files
+- Fixed block height formula: `height = filename + line_count + 1`

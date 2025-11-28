@@ -2,7 +2,7 @@ use crate::parsers::batch::BatchEnvelope;
 use crate::parsers::utils::deserialize_option_string;
 use crate::parsers::{
     drain_complete_lines, line_preview, normalize_tx_hash, parse_iso8601_to_millis,
-    partition_key_or_unknown, trim_line_bytes, Parser, LINE_PREVIEW_LIMIT,
+    trim_line_bytes, Parser, LINE_PREVIEW_LIMIT,
 };
 use crate::sorter_client::proto::DataRecord;
 use anyhow::{Context, Result};
@@ -152,44 +152,13 @@ fn order_status_to_record(
         .or_else(|| block_time.and_then(parse_iso8601_to_millis))
         .unwrap_or(0);
 
-    let (coin, oid) = extract_order_identity(&status);
-    let partition_key = format!(
-        "{}-{}-{}",
-        partition_key_or_unknown(&user),
-        partition_key_or_unknown(&coin),
-        partition_key_or_unknown(&oid)
-    );
-
     Ok(DataRecord {
         block_height,
         tx_hash,
         timestamp,
         topic: "hl.orders".to_string(),
-        partition_key,
         payload,
     })
-}
-
-fn extract_order_identity(status: &Value) -> (String, String) {
-    if let Some(order_value) = status
-        .as_object()
-        .and_then(|map| map.get("order"))
-        .or_else(|| status.get("order"))
-    {
-        if let Some(order) = order_value.as_object() {
-            let coin = order
-                .get("coin")
-                .and_then(Value::as_str)
-                .unwrap_or_default()
-                .to_string();
-            let oid = order
-                .get("oid")
-                .and_then(value_to_string)
-                .unwrap_or_default();
-            return (coin, oid);
-        }
-    }
-    (String::new(), String::new())
 }
 
 fn extract_order_fields(status: &Value) -> OrderFieldValues {

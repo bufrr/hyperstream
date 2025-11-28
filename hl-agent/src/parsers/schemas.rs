@@ -41,7 +41,6 @@ impl Block {
             tx_hash: None,
             timestamp: self.block_time,
             topic: "hl.blocks".to_string(),
-            partition_key: self.height.to_string(),
             payload,
         })
     }
@@ -77,18 +76,11 @@ impl Transaction {
             Some(self.hash.clone())
         };
 
-        let partition_key = if self.user.is_empty() {
-            "unknown".to_string()
-        } else {
-            self.user.clone()
-        };
-
         Ok(DataRecord {
             block_height: Some(self.block),
             tx_hash,
             timestamp: self.time,
             topic: "hl.transactions".to_string(),
-            partition_key,
             payload,
         })
     }
@@ -161,7 +153,6 @@ mod tests {
 
         let record = block.to_data_record().unwrap();
         assert_eq!(record.topic, "hl.blocks");
-        assert_eq!(record.partition_key, "100");
         assert_eq!(record.block_height, Some(100));
         assert_eq!(record.timestamp, 1700000000000);
     }
@@ -179,7 +170,6 @@ mod tests {
 
         let record = tx.to_data_record().unwrap();
         assert_eq!(record.topic, "hl.transactions");
-        assert_eq!(record.partition_key, "0xuser");
         assert_eq!(record.tx_hash, Some("0xhash".to_string()));
     }
 }
