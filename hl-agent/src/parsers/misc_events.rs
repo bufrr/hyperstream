@@ -1,6 +1,7 @@
+use crate::parsers::batch::BatchEnvelope;
 use crate::parsers::{
-    drain_complete_lines, line_preview, normalize_tx_hash, parse_iso8601_to_millis,
-    trim_line_bytes, Parser,
+    line_preview, normalize_tx_hash, parse_iso8601_to_millis, BufferedLineParser, LineParser,
+    LINE_PREVIEW_LIMIT,
 };
 use crate::sorter_client::proto::DataRecord;
 use anyhow::{Context, Result};
@@ -9,15 +10,24 @@ use serde_json::{self, Map, Value};
 use std::path::Path;
 use tracing::warn;
 
-const LINE_PREVIEW_LIMIT: usize = 256;
-
 /// Converts miscellaneous JSON events into the `hl.misc_events` stream.
 ///
 /// The parser expects the `node_misc_events` batch format, extracts user identifiers when
 /// available, and serializes a compact payload `{time, hash, inner}` for sorter.
-#[derive(Default)]
-pub struct MiscEventsParser {
-    buffer: Vec<u8>,
+pub type MiscEventsParser = BufferedLineParser<MiscEventsLineParser>;
+
+/// Creates a new MiscEventsParser with default configuration.
+pub fn new_misc_events_parser() -> MiscEventsParser {
+    BufferedLineParser::new(MiscEventsLineParser)
+}
+
+/// Inner line parser for misc events - handles parsing individual lines.
+pub struct MiscEventsLineParser;
+
+impl Default for MiscEventsLineParser {
+    fn default() -> Self {
+        Self
+    }
 }
 
 #[derive(Serialize)]
@@ -28,14 +38,6 @@ struct MiscEvent {
 }
 
 #[derive(Deserialize)]
-struct NodeMiscEventBatch {
-    #[serde(alias = "blockNumber", alias = "block_number", alias = "block_height")]
-    block_number: u64,
-    #[serde(default, deserialize_with = "deserialize_misc_events")]
-    events: Vec<RawMiscEvent>,
-}
-
-#[derive(Deserialize)]
 struct RawMiscEvent {
     time: String,
     hash: String,
@@ -43,40 +45,25 @@ struct RawMiscEvent {
     payload: Map<String, Value>,
 }
 
-impl Parser for MiscEventsParser {
-    fn parse(&mut self, _file_path: &Path, data: &[u8]) -> Result<Vec<DataRecord>> {
-        self.buffer.extend_from_slice(data);
-        let lines = drain_complete_lines(&mut self.buffer);
-        let mut records = Vec::with_capacity(lines.len());
-
-        for (line_idx, raw_line) in lines.into_iter().enumerate() {
-            let line = trim_line_bytes(raw_line);
-            if line.is_empty() {
-                continue;
+impl LineParser for MiscEventsLineParser {
+    fn parse_line(&mut self, _file_path: &Path, line: &[u8]) -> Result<Vec<DataRecord>> {
+        match serde_json::from_slice::<BatchEnvelope<RawMiscEvent>>(line) {
+            Ok(batch) => {
+                let mut records = Vec::with_capacity(batch.events.len());
+                for event in batch.events {
+                    records.push(node_misc_event_to_record(event, Some(batch.block_number))?);
+                }
+                Ok(records)
             }
-
-            match serde_json::from_slice::<NodeMiscEventBatch>(&line) {
-                Ok(batch) => {
-                    for event in batch.events {
-                        records.push(node_misc_event_to_record(event, Some(batch.block_number))?);
-                    }
-                }
-                Err(err) => {
-                    warn!(
-                        error = %err,
-                        line_idx,
-                        preview = %line_preview(&line, LINE_PREVIEW_LIMIT),
-                        "skipping unrecognized misc event line format"
-                    );
-                }
+            Err(err) => {
+                warn!(
+                    error = %err,
+                    preview = %line_preview(line, LINE_PREVIEW_LIMIT),
+                    "skipping unrecognized misc event line format"
+                );
+                Ok(Vec::new())
             }
         }
-
-        Ok(records)
-    }
-
-    fn backlog_len(&self) -> usize {
-        self.buffer.len()
     }
 }
 
@@ -170,26 +157,5 @@ fn extract_user_from_event(event_data: &Value) -> String {
             .unwrap_or_default()
     } else {
         String::new()
-    }
-}
-
-fn deserialize_misc_events<'de, D>(deserializer: D) -> Result<Vec<RawMiscEvent>, D::Error>
-where
-    D: serde::Deserializer<'de>,
-{
-    let value = Option::<Value>::deserialize(deserializer)?;
-    match value {
-        None | Some(Value::Null) => Ok(Vec::new()),
-        Some(Value::Array(items)) => items
-            .into_iter()
-            .map(|item| serde_json::from_value(item).map_err(serde::de::Error::custom))
-            .collect(),
-        Some(Value::Object(map)) => map
-            .into_iter()
-            .map(|(_, item)| serde_json::from_value(item).map_err(serde::de::Error::custom))
-            .collect(),
-        Some(other) => Err(serde::de::Error::custom(format!(
-            "expected misc event list or map, got {other:?}"
-        ))),
     }
 }

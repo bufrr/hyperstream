@@ -1,15 +1,16 @@
+use crate::parsers::block_merger::{BlockMerger, ReplicaBlockData};
+use crate::parsers::utils::extract_starting_block;
 use crate::parsers::{
     drain_complete_lines, line_preview, parse_iso8601_to_millis, trim_line_bytes,
+    LINE_PREVIEW_LIMIT,
 };
 use crate::sorter_client::proto::DataRecord;
-use anyhow::{Context, Result};
+use anyhow::Result;
 use dashmap::DashMap;
-use serde::{Deserialize, Serialize};
+use serde::Deserialize;
 use std::path::Path;
 use std::sync::{Arc, OnceLock};
 use tracing::warn;
-
-const REPLICA_LINE_PREVIEW: usize = 256;
 
 pub(crate) type SharedProposerCache = Arc<DashMap<u64, String>>;
 
@@ -21,14 +22,25 @@ pub(crate) fn proposer_cache() -> SharedProposerCache {
         .clone()
 }
 
-/// Parses `replica_cmds` JSONL files and emits canonical `hl.blocks` records.
+/// Parses `replica_cmds` JSONL files and adds blocks to the BlockMerger.
 ///
 /// Input lines are the same structures produced by `periodic_abci_states` where each line contains
-/// an `abci_block`. The parser caches proposers for later use by the transaction parser and emits
-/// one `DataRecord` per block on the `hl.blocks` topic.
+/// an `abci_block`. The parser caches proposers for later use by the transaction parser.
+///
+/// Block height is calculated as: `starting_block (from filename) + line_number`
+/// Block hash comes from the BlockMerger which pairs replica data with Explorer WebSocket hashes.
+///
+/// Note: This parser adds blocks to the global BlockMerger instead of emitting DataRecords directly.
+/// The BlockMerger's flush task is responsible for emitting merged blocks.
 pub struct BlocksParser {
     buffer: Vec<u8>,
     proposer_cache: SharedProposerCache,
+    /// Starting block number extracted from filename (e.g., 808750000 from ".../808750000")
+    starting_block: Option<u64>,
+    /// Current line count within the file (0-indexed, first line = block at starting_block)
+    line_count: u64,
+    /// Reference to the global block merger
+    merger: Arc<BlockMerger>,
 }
 
 impl Default for BlocksParser {
@@ -36,20 +48,11 @@ impl Default for BlocksParser {
         Self {
             buffer: Vec::new(),
             proposer_cache: proposer_cache(),
+            starting_block: None,
+            line_count: 0,
+            merger: BlockMerger::global(),
         }
     }
-}
-
-#[derive(Serialize)]
-#[serde(rename_all = "camelCase")]
-struct BlockRecord {
-    height: u64,
-    block_time: u64,
-    hash: String, // Always empty (not available in replica_cmds)
-    proposer: String,
-    #[serde(rename = "numTxs")]
-    num_txs: u64,
-    round: u64,
 }
 
 #[derive(Debug, Deserialize, Default)]
@@ -71,7 +74,18 @@ struct ReplicaAbciBlock {
 }
 
 impl crate::parsers::Parser for BlocksParser {
-    fn parse(&mut self, _file_path: &Path, data: &[u8]) -> Result<Vec<DataRecord>> {
+    fn parse(&mut self, file_path: &Path, data: &[u8]) -> Result<Vec<DataRecord>> {
+        // Extract starting block from filename on first call
+        if self.starting_block.is_none() {
+            self.starting_block = extract_starting_block(file_path);
+            if self.starting_block.is_none() {
+                warn!(
+                    file_path = %file_path.display(),
+                    "could not extract starting block from filename, falling back to round"
+                );
+            }
+        }
+
         self.buffer.extend_from_slice(data);
         if self.buffer.is_empty() {
             return Ok(Vec::new());
@@ -83,25 +97,35 @@ impl crate::parsers::Parser for BlocksParser {
         for raw_line in lines {
             let line = trim_line_bytes(raw_line);
             if line.is_empty() {
+                self.line_count += 1;
                 continue;
             }
+
+            // Calculate block height: starting_block + line_count
+            let calculated_height = self.starting_block.map(|start| start + self.line_count);
 
             match serde_json::from_slice::<ReplicaCmd>(&line) {
                 Ok(cmd) => {
                     if let Some(block) = cmd.abci_block {
-                        // Cache proposer for transactions parser
-                        if block.round != 0 && !block.proposer.is_empty() {
-                            self.proposer_cache
-                                .insert(block.round, block.proposer.clone());
+                        // Use calculated height, fall back to round if filename parsing failed
+                        let height = calculated_height.unwrap_or(block.round);
+
+                        // Cache proposer for transactions parser using the correct height
+                        if height != 0 && !block.proposer.is_empty() {
+                            self.proposer_cache.insert(height, block.proposer.clone());
                         }
 
-                        if let Some(record) = self.abci_block_to_record(block) {
-                            match block_record_to_data_record(record) {
+                        // Convert to ReplicaBlockData and process through merger
+                        if let Some(replica_data) = self.abci_block_to_replica_data(block, height) {
+                            // Process block - looks up hash from cache and returns merged block
+                            let merged = self.merger.process_file_block_blocking(replica_data);
+                            match merged.to_data_record() {
                                 Ok(data_record) => records.push(data_record),
                                 Err(err) => {
                                     warn!(
                                         error = %err,
-                                        "failed to convert abci_block to data record"
+                                        height,
+                                        "failed to convert merged block to data record"
                                     );
                                 }
                             }
@@ -111,11 +135,13 @@ impl crate::parsers::Parser for BlocksParser {
                 Err(err) => {
                     warn!(
                         error = %err,
-                        preview = %line_preview(&line, REPLICA_LINE_PREVIEW),
+                        preview = %line_preview(&line, LINE_PREVIEW_LIMIT),
                         "failed to parse replica_cmds line"
                     );
                 }
             }
+
+            self.line_count += 1;
         }
         Ok(records)
     }
@@ -123,22 +149,6 @@ impl crate::parsers::Parser for BlocksParser {
     fn backlog_len(&self) -> usize {
         self.buffer.len()
     }
-}
-
-fn block_record_to_data_record(block_payload: BlockRecord) -> Result<DataRecord> {
-    let block_height = block_payload.height;
-    let timestamp = block_payload.block_time;
-    let payload =
-        serde_json::to_vec(&block_payload).context("failed to encode hl.blocks payload")?;
-
-    Ok(DataRecord {
-        block_height: Some(block_height),
-        tx_hash: None,
-        timestamp,
-        topic: "hl.blocks".to_string(),
-        partition_key: block_height.to_string(),
-        payload,
-    })
 }
 
 fn parse_abci_block_time(time: &str) -> u64 {
@@ -156,19 +166,23 @@ fn parse_abci_block_time(time: &str) -> u64 {
 }
 
 impl BlocksParser {
-    fn abci_block_to_record(&self, block: ReplicaAbciBlock) -> Option<BlockRecord> {
-        if block.round == 0 {
+    /// Convert ABCI block to ReplicaBlockData for the merger
+    fn abci_block_to_replica_data(
+        &self,
+        block: ReplicaAbciBlock,
+        height: u64,
+    ) -> Option<ReplicaBlockData> {
+        // Skip if height is 0 (invalid block)
+        if height == 0 {
             return None;
         }
 
-        let timestamp = parse_abci_block_time(&block.time);
+        let block_time = parse_abci_block_time(&block.time);
         let num_txs = block.signed_action_bundles.len() as u64;
-        let height = block.round;
 
-        Some(BlockRecord {
+        Some(ReplicaBlockData {
             height,
-            block_time: timestamp,
-            hash: String::new(), // Not available in replica_cmds
+            block_time,
             proposer: block.proposer,
             num_txs,
             round: block.round,

@@ -1,7 +1,7 @@
 use super::fill_types::{parse_fill_line, FillLine, NodeFill};
 use crate::parsers::{
-    drain_complete_lines, line_preview, normalize_tx_hash, partition_key_or_unknown,
-    trim_line_bytes, Parser,
+    line_preview, normalize_tx_hash, partition_key_or_unknown, BufferedLineParser, LineParser,
+    LINE_PREVIEW_LIMIT,
 };
 use crate::sorter_client::proto::DataRecord;
 use anyhow::{Context, Result};
@@ -10,19 +10,23 @@ use serde_json::Value;
 use std::path::Path;
 use tracing::warn;
 
-const LINE_PREVIEW_LIMIT: usize = 256;
-
 /// Converts `node_fills_by_block` JSON lines into tuple payloads for the `hl.fills` topic.
 ///
 /// The parser accepts both single fill lines and aggregated batch lines, buffers partial reads, and
 /// outputs `[user, fill_details]` tuples using the schema sorter expects.
-pub struct FillsParser {
-    buffer: Vec<u8>,
+pub type FillsParser = BufferedLineParser<FillsLineParser>;
+
+/// Creates a new FillsParser with default configuration.
+pub fn new_fills_parser() -> FillsParser {
+    BufferedLineParser::new(FillsLineParser)
 }
 
-impl Default for FillsParser {
+/// Inner line parser for fills - handles parsing individual lines.
+pub struct FillsLineParser;
+
+impl Default for FillsLineParser {
     fn default() -> Self {
-        Self { buffer: Vec::new() }
+        Self
     }
 }
 
@@ -50,45 +54,32 @@ struct FillDetails {
     liquidation: Option<Value>,
 }
 
-impl Parser for FillsParser {
-    fn parse(&mut self, _file_path: &Path, data: &[u8]) -> Result<Vec<DataRecord>> {
-        self.buffer.extend_from_slice(data);
-        let lines = drain_complete_lines(&mut self.buffer);
-        let mut records = Vec::with_capacity(lines.len());
+impl LineParser for FillsLineParser {
+    fn parse_line(&mut self, _file_path: &Path, line: &[u8]) -> Result<Vec<DataRecord>> {
+        let mut records = Vec::new();
 
-        for raw_line in lines {
-            let line = trim_line_bytes(raw_line);
-            if line.is_empty() {
-                continue;
+        match parse_fill_line(line) {
+            Ok(FillLine::Batch(batch)) => {
+                let block_number = batch.block_number;
+                for (user, mut fill) in batch.events {
+                    fill.user = user;
+                    fill.block_height = Some(block_number);
+                    records.push(node_fill_to_record(fill)?);
+                }
             }
-
-            match parse_fill_line(&line) {
-                Ok(FillLine::Batch(batch)) => {
-                    let block_number = batch.block_number;
-                    for (user, mut fill) in batch.events {
-                        fill.user = user;
-                        fill.block_height = Some(block_number);
-                        records.push(node_fill_to_record(fill)?);
-                    }
-                }
-                Ok(FillLine::Single(fill)) => {
-                    records.push(node_fill_to_record(*fill)?);
-                }
-                Err(err) => {
-                    warn!(
-                        error = %err,
-                        preview = %line_preview(&line, LINE_PREVIEW_LIMIT),
-                        "failed to parse fill line as JSON"
-                    );
-                }
+            Ok(FillLine::Single(fill)) => {
+                records.push(node_fill_to_record(*fill)?);
+            }
+            Err(err) => {
+                warn!(
+                    error = %err,
+                    preview = %line_preview(line, LINE_PREVIEW_LIMIT),
+                    "failed to parse fill line as JSON"
+                );
             }
         }
 
         Ok(records)
-    }
-
-    fn backlog_len(&self) -> usize {
-        self.buffer.len()
     }
 }
 

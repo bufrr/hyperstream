@@ -1,7 +1,7 @@
 use super::fill_types::{parse_fill_line, FillLine, NodeFill};
 use crate::parsers::{
     drain_complete_lines, line_preview, normalize_tx_hash, partition_key_or_unknown,
-    trim_line_bytes, Parser,
+    trim_line_bytes, Parser, LINE_PREVIEW_LIMIT,
 };
 use crate::sorter_client::proto::DataRecord;
 use anyhow::{Context, Result};
@@ -9,8 +9,6 @@ use serde::Serialize;
 use std::collections::HashMap;
 use std::path::Path;
 use tracing::warn;
-
-const LINE_PREVIEW_LIMIT: usize = 256;
 
 /// Aggregates fill events into user-to-user trade records for the `hl.trades` topic.
 ///
@@ -84,19 +82,12 @@ impl Parser for TradesParser {
             }
         }
 
-        // Flush all pending trades at end of file
-        // (we're processing historical files, so emit what we have)
-        for (_tid, fills) in self.pending.drain() {
-            if let Some(record) = build_trade_from_fills(fills)? {
-                records.push(record);
-            }
-        }
-
         Ok(records)
     }
 
     fn backlog_len(&self) -> usize {
-        self.buffer.len()
+        // Account for buffered bytes and pending fills so checkpoints remain safe
+        self.buffer.len() + self.pending.len() * 100
     }
 }
 

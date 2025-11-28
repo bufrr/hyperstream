@@ -1,6 +1,7 @@
 use super::{
     deserialize_option_u64_from_any, deserialize_string_or_number, deserialize_u64_from_any,
 };
+use crate::parsers::batch::FillBatchEnvelope;
 use serde::Deserialize;
 use serde_json::Value;
 use std::fmt;
@@ -82,19 +83,9 @@ pub(crate) struct NodeFill {
     pub(crate) hash: String,
 }
 
-#[derive(Debug, Deserialize)]
-pub(crate) struct NodeFillBatch {
-    #[serde(alias = "blockNumber", alias = "block_height", alias = "blockHeight")]
-    pub(crate) block_number: u64,
-    #[serde(default, alias = "round", alias = "height")]
-    pub(crate) _round: Option<u64>,
-    #[serde(default)]
-    pub(crate) events: Vec<(String, NodeFill)>,
-}
-
 #[derive(Debug)]
 pub(crate) enum FillLine {
-    Batch(NodeFillBatch),
+    Batch(FillBatchEnvelope<NodeFill>),
     Single(Box<NodeFill>),
 }
 
@@ -115,7 +106,7 @@ impl fmt::Display for FillLineParseError {
 }
 
 pub(crate) fn parse_fill_line(line: &[u8]) -> Result<FillLine, FillLineParseError> {
-    match serde_json::from_slice::<NodeFillBatch>(line) {
+    match serde_json::from_slice::<FillBatchEnvelope<NodeFill>>(line) {
         Ok(batch) => Ok(FillLine::Batch(batch)),
         Err(batch_err) => match serde_json::from_slice::<NodeFill>(line) {
             Ok(fill) => Ok(FillLine::Single(Box::new(fill))),

@@ -1,15 +1,13 @@
+use crate::parsers::current_timestamp;
 use anyhow::{Context, Result};
 use rusqlite::{params, Connection, OptionalExtension};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::time::{SystemTime, UNIX_EPOCH};
 use tokio::task;
-
-type SharedConnection = Arc<std::sync::Mutex<Connection>>;
 
 #[derive(Debug, Clone)]
 pub struct CheckpointDB {
-    conn: SharedConnection,
+    path: Arc<PathBuf>,
 }
 
 #[allow(dead_code)]
@@ -24,46 +22,26 @@ pub struct CheckpointRecord {
 
 impl CheckpointDB {
     pub fn new(path: impl AsRef<Path>) -> Result<Self> {
-        let path = path.as_ref();
+        let path = path.as_ref().to_path_buf();
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent).with_context(|| {
                 format!("failed to create checkpoint directory {}", parent.display())
             })?;
         }
 
-        let conn = Connection::open(path)
-            .with_context(|| format!("failed to open checkpoint db {}", path.display()))?;
-
-        conn.pragma_update(None, "journal_mode", "WAL")
-            .context("failed to enable WAL mode for checkpoint db")?;
-        conn.pragma_update(None, "synchronous", "NORMAL")
-            .context("failed to set checkpoint db synchronous mode")?;
-
-        conn.execute_batch(
-            "
-            CREATE TABLE IF NOT EXISTS checkpoints (
-                file_path TEXT PRIMARY KEY,
-                byte_offset INTEGER NOT NULL,
-                file_size INTEGER NOT NULL,
-                last_modified_ts INTEGER NOT NULL,
-                updated_at INTEGER NOT NULL
-            );
-            ",
-        )
-        .context("failed to create checkpoints table")?;
+        let conn = open_connection(&path)?;
+        initialize_schema(&conn)?;
 
         Ok(Self {
-            conn: Arc::new(std::sync::Mutex::new(conn)),
+            path: Arc::new(path),
         })
     }
 
     pub async fn get(&self, file_path: &Path) -> Result<Option<CheckpointRecord>> {
-        let conn = self.conn.clone();
+        let db_path = self.path.clone();
         let path = normalize_path(file_path);
         task::spawn_blocking(move || {
-            let conn = conn
-                .lock()
-                .expect("checkpoint connection poisoned while getting record");
+            let conn = open_connection(&db_path)?;
             let mut stmt = conn
                 .prepare(
                     "
@@ -109,13 +87,11 @@ impl CheckpointDB {
         file_size: u64,
         last_modified_ts: i64,
     ) -> Result<()> {
-        let conn = self.conn.clone();
+        let db_path = self.path.clone();
         let path = normalize_path(file_path);
         let timestamp = current_timestamp();
         task::spawn_blocking(move || {
-            let conn = conn
-                .lock()
-                .expect("checkpoint connection poisoned while setting record");
+            let conn = open_connection(&db_path)?;
             conn.execute(
                 "
                 INSERT INTO checkpoints (
@@ -150,13 +126,35 @@ impl CheckpointDB {
     }
 }
 
-fn current_timestamp() -> i64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_secs() as i64)
-        .unwrap_or_default()
-}
-
 fn normalize_path(path: &Path) -> String {
     path.to_string_lossy().into_owned()
+}
+
+fn open_connection(path: &Path) -> Result<Connection> {
+    let conn = Connection::open(path)
+        .with_context(|| format!("failed to open checkpoint db {}", path.display()))?;
+
+    conn.pragma_update(None, "journal_mode", "WAL")
+        .context("failed to enable WAL mode for checkpoint db")?;
+    conn.pragma_update(None, "synchronous", "NORMAL")
+        .context("failed to set checkpoint db synchronous mode")?;
+
+    Ok(conn)
+}
+
+fn initialize_schema(conn: &Connection) -> Result<()> {
+    conn.execute_batch(
+        "
+        CREATE TABLE IF NOT EXISTS checkpoints (
+            file_path TEXT PRIMARY KEY,
+            byte_offset INTEGER NOT NULL,
+            file_size INTEGER NOT NULL,
+            last_modified_ts INTEGER NOT NULL,
+            updated_at INTEGER NOT NULL
+        );
+        ",
+    )
+    .context("failed to create checkpoints table")?;
+
+    Ok(())
 }

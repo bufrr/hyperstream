@@ -4,7 +4,7 @@ use notify::{
 };
 use std::path::PathBuf;
 use std::time::Duration;
-use tokio::sync::mpsc;
+use tokio::sync::mpsc::{self, error::TrySendError};
 use tokio::time::sleep;
 use tracing::{debug, error, info, warn};
 
@@ -14,10 +14,12 @@ pub enum FileEvent {
     Modified(PathBuf),
 }
 
+pub const WATCHER_CHANNEL_CAPACITY: usize = 1000;
+
 pub async fn watch_directories(
     watch_paths: Vec<PathBuf>,
     poll_interval: Duration,
-    event_tx: mpsc::UnboundedSender<FileEvent>,
+    event_tx: mpsc::Sender<FileEvent>,
 ) -> Result<()> {
     let watcher_tx = event_tx.clone();
 
@@ -47,7 +49,7 @@ pub async fn watch_directories(
     }
 }
 
-fn handle_event(event_tx: &mpsc::UnboundedSender<FileEvent>, event: Event) {
+fn handle_event(event_tx: &mpsc::Sender<FileEvent>, event: Event) {
     match event.kind {
         EventKind::Create(_) => {
             for path in event.paths {
@@ -55,9 +57,7 @@ fn handle_event(event_tx: &mpsc::UnboundedSender<FileEvent>, event: Event) {
                     continue;
                 }
                 debug!(path = %path.display(), "detected file creation");
-                if let Err(err) = event_tx.send(FileEvent::Created(path)) {
-                    warn!(error = %err, "failed to enqueue created file event");
-                }
+                send_event(event_tx, FileEvent::Created(path), "created");
             }
         }
         EventKind::Modify(_) => {
@@ -66,11 +66,21 @@ fn handle_event(event_tx: &mpsc::UnboundedSender<FileEvent>, event: Event) {
                     continue;
                 }
                 debug!(path = %path.display(), "detected file modification");
-                if let Err(err) = event_tx.send(FileEvent::Modified(path)) {
-                    warn!(error = %err, "failed to enqueue modified file event");
-                }
+                send_event(event_tx, FileEvent::Modified(path), "modified");
             }
         }
         _ => {}
+    }
+}
+
+fn send_event(event_tx: &mpsc::Sender<FileEvent>, event: FileEvent, kind: &str) {
+    match event_tx.try_send(event) {
+        Ok(_) => {}
+        Err(TrySendError::Full(_)) => {
+            warn!(kind, "watcher channel full; dropping file event");
+        }
+        Err(TrySendError::Closed(_)) => {
+            warn!(kind, "watcher channel closed; dropping file event");
+        }
     }
 }

@@ -1,10 +1,6 @@
 # hl-agent configuration example
 # Copy this file to config.toml and customize for your deployment.
 
-# Source selection: "file" (default) tails Hyperliquid node files.
-# Set to "websocket" to stream explorerBlock data from the Explorer WS.
-mode = "file"
-
 [node]
 # Unique identifier for this agent instance (used in sorter metadata)
 node_id = "hl-agent-1"
@@ -17,7 +13,6 @@ data_dir = "~/hl-data"
 # These correspond to Hyperliquid's output directories.
 watch_paths = [
     "replica_cmds",                    # Blocks + transactions
-    "node_trades",                     # Trade data
     "node_fills_by_block",            # Fill data (produces fills + trades)
     "node_order_statuses_by_block",   # Order status data
     "misc_events_by_block"            # Miscellaneous node events
@@ -46,8 +41,10 @@ batch_size = 100
 # (Tracks per-file offsets so processing resumes where it left off)
 db_path = "~/.hl-agent/checkpoint.db"
 
-# Optional: how often to persist checkpoints (records between updates)
-# update_interval_records = 1000
+# Redis endpoint for reading block hashes from ws-agent (defaults to redis://127.0.0.1:6379)
+# The ws-agent binary subscribes to the Explorer WebSocket and stores block hashes in Redis.
+# hl-agent reads from Redis to enrich blocks with their hashes.
+redis_url = "redis://127.0.0.1:6379"
 
 [performance]
 # Maximum number of concurrent file tailer tasks (default: 64)
@@ -57,14 +54,6 @@ db_path = "~/.hl-agent/checkpoint.db"
 # bulk_load_warn_bytes = 524288000
 # bulk_load_abort_bytes = 1073741824
 
-# ------------------------------------------------------------------------------
-# Optional WebSocket mode
-# ------------------------------------------------------------------------------
-# To stream hl.blocks directly from the Hyperliquid Explorer WebSocket:
-#   1. Set `mode = "websocket"` above.
-#   2. Configure the endpoint below (omit if using the default mainnet URL).
-#
-# [explorer_ws]
-# # Mainnet: wss://rpc.hyperliquid.xyz/ws
-# # Testnet: wss://api.hyperliquid-testnet.xyz/ws
-# url = "wss://rpc.hyperliquid.xyz/ws"
+# Retry behavior for sorter send failures (defaults: 5 attempts, 500ms base backoff)
+# sink_retry_max_attempts = 5
+# sink_retry_base_delay_ms = 500

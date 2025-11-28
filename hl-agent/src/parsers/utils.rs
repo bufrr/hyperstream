@@ -6,6 +6,54 @@
 //! - Transaction hash normalization
 //! - Flexible deserialization helpers
 //! - Partition key generation
+//! - File path utilities
+//! - System timestamp utilities
+
+use serde::de::DeserializeOwned;
+use serde::Deserialize;
+use std::path::Path;
+use std::time::{SystemTime, UNIX_EPOCH};
+
+/// Default limit for line preview in error messages (256 characters)
+pub const LINE_PREVIEW_LIMIT: usize = 256;
+
+/// Extracts starting block number from file path (e.g., "808750000" from path).
+///
+/// Returns None if the filename cannot be parsed as a u64.
+pub(crate) fn extract_starting_block(file_path: &Path) -> Option<u64> {
+    file_path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .and_then(|name| name.parse::<u64>().ok())
+}
+
+/// Flexible deserializer for Option<String> that handles various input types.
+///
+/// Returns None for null/empty values, Some(String) otherwise.
+/// Handles strings, numbers, and booleans.
+pub(crate) fn deserialize_option_string<'de, D>(deserializer: D) -> Result<Option<String>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    use serde::Deserialize;
+    let value = Option::<serde_json::Value>::deserialize(deserializer)?;
+    match value {
+        None | Some(serde_json::Value::Null) => Ok(None),
+        Some(serde_json::Value::String(s)) => {
+            let trimmed = s.trim();
+            if trimmed.is_empty() {
+                Ok(None)
+            } else {
+                Ok(Some(trimmed.to_string()))
+            }
+        }
+        Some(serde_json::Value::Number(n)) => Ok(Some(n.to_string())),
+        Some(serde_json::Value::Bool(b)) => Ok(Some(b.to_string())),
+        Some(other) => Err(serde::de::Error::custom(format!(
+            "expected string or null, got {other:?}"
+        ))),
+    }
+}
 
 /// Extracts complete lines (ending with `\n`) from a buffer.
 ///
@@ -240,6 +288,16 @@ pub(crate) fn normalize_tx_hash(hash: &str) -> Option<String> {
     Some(trimmed.to_string())
 }
 
+/// Returns the current Unix timestamp in seconds.
+///
+/// Used for checkpoint tracking and hash store caching.
+pub fn current_timestamp() -> i64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or_default()
+}
+
 // ===== Private helper functions =====
 
 fn parse_timezone_offset_minutes(part: &str) -> Option<i32> {
@@ -304,6 +362,39 @@ fn days_from_civil(year: i32, month: u32, day: u32) -> Option<i64> {
     let day_of_era = year_of_era as i64 * 365 + year_of_era as i64 / 4 - year_of_era as i64 / 100
         + day_of_year as i64;
     Some(era as i64 * 146_097 + day_of_era - 719468)
+}
+
+/// Generic deserializer for event lists that may be null, an array, or an object-map.
+///
+/// Handles flexible input formats commonly seen in Hyperliquid node data:
+/// - `null` → empty Vec
+/// - `[...]` → Vec from array items
+/// - `{key1: ..., key2: ...}` → Vec from object values (keys ignored)
+///
+/// The `context` parameter is used for error messages to identify the event type.
+pub(crate) fn deserialize_flexible_events<'de, D, T>(
+    deserializer: D,
+    context: &'static str,
+) -> Result<Vec<T>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+    T: DeserializeOwned,
+{
+    let value = Option::<serde_json::Value>::deserialize(deserializer)?;
+    match value {
+        None | Some(serde_json::Value::Null) => Ok(Vec::new()),
+        Some(serde_json::Value::Array(arr)) => arr
+            .into_iter()
+            .map(|item| serde_json::from_value(item).map_err(serde::de::Error::custom))
+            .collect(),
+        Some(serde_json::Value::Object(map)) => map
+            .into_iter()
+            .map(|(_, item)| serde_json::from_value(item).map_err(serde::de::Error::custom))
+            .collect(),
+        Some(other) => Err(serde::de::Error::custom(format!(
+            "expected {context} list or object, got {other:?}"
+        ))),
+    }
 }
 
 #[cfg(test)]

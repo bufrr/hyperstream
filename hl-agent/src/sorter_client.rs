@@ -1,8 +1,12 @@
 use anyhow::{anyhow, Result};
-use tokio::sync::mpsc;
+use std::sync::Arc;
+use std::time::Duration;
+use tokio::sync::{mpsc, Mutex};
+use tokio::time::sleep;
 use tokio_stream::wrappers::ReceiverStream;
 use tonic::transport::Channel;
 use tonic::Request;
+use tracing::{error, warn};
 
 pub mod proto {
     tonic::include_proto!("hyperstream");
@@ -13,9 +17,16 @@ use proto::{DataBatch, DataRecord, SourceMetadata};
 
 #[derive(Clone)]
 pub struct BatchSender {
-    tx: mpsc::Sender<DataBatch>,
+    inner: Arc<BatchSenderInner>,
+}
+
+struct BatchSenderInner {
+    tx: Mutex<mpsc::Sender<DataBatch>>,
+    client: SorterServiceClient<Channel>,
     node_id: String,
     agent_id: String,
+    max_retries: usize,
+    base_backoff: Duration,
 }
 
 impl BatchSender {
@@ -32,18 +43,59 @@ impl BatchSender {
 
         let batch = DataBatch {
             source: Some(SourceMetadata {
-                node_id: self.node_id.clone(),
-                agent_id: self.agent_id.clone(),
+                node_id: self.inner.node_id.clone(),
+                agent_id: self.inner.agent_id.clone(),
                 file_path,
                 byte_offset,
             }),
             records,
         };
 
-        self.tx
-            .send(batch)
-            .await
-            .map_err(|err| anyhow!("failed to enqueue batch for sorter stream: {err}"))
+        let mut attempt: usize = 0;
+        let mut backoff = self.inner.base_backoff.max(Duration::from_millis(1));
+
+        loop {
+            let sender = { self.inner.tx.lock().await.clone() };
+            match sender.send(batch.clone()).await {
+                Ok(_) => return Ok(()),
+                Err(err) => {
+                    attempt += 1;
+                    if attempt > self.inner.max_retries {
+                        return Err(anyhow!(
+                            "failed to enqueue batch after {} attempts: {err}",
+                            attempt
+                        ));
+                    }
+
+                    warn!(
+                        attempt,
+                        max_attempts = self.inner.max_retries,
+                        error = %err,
+                        "sorter channel send failed; attempting reconnect with backoff"
+                    );
+
+                    self.reconnect_stream().await?;
+                    sleep(backoff).await;
+                    backoff = std::cmp::min(backoff.saturating_mul(2), Duration::from_secs(30));
+                }
+            }
+        }
+    }
+
+    async fn reconnect_stream(&self) -> Result<()> {
+        let mut client = self.inner.client.clone();
+        let (tx, rx) = mpsc::channel(1000);
+        let request = Request::new(ReceiverStream::new(rx));
+
+        tokio::spawn(async move {
+            if let Err(err) = client.stream_data(request).await {
+                error!(error = %err, "sorter stream terminated");
+            }
+        });
+
+        let mut guard = self.inner.tx.lock().await;
+        *guard = tx;
+        Ok(())
     }
 }
 
@@ -78,7 +130,11 @@ impl SorterClient {
 
     /// Start unidirectional streaming session
     /// Returns: batch sender handle
-    pub async fn start_stream(&mut self) -> Result<BatchSender> {
+    pub async fn start_stream(
+        &mut self,
+        max_retries: usize,
+        base_backoff: Duration,
+    ) -> Result<BatchSender> {
         // Limit in-flight batches so a slow gRPC sink can't grow memory without bound.
         let (tx, rx) = mpsc::channel(1000);
 
@@ -92,9 +148,14 @@ impl SorterClient {
         });
 
         Ok(BatchSender {
-            tx,
-            node_id: self.node_id.clone(),
-            agent_id: self.agent_id.clone(),
+            inner: Arc::new(BatchSenderInner {
+                tx: Mutex::new(tx),
+                client: self.client.clone(),
+                node_id: self.node_id.clone(),
+                agent_id: self.agent_id.clone(),
+                max_retries,
+                base_backoff,
+            }),
         })
     }
 }

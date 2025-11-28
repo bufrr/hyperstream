@@ -1,85 +1,80 @@
-# Hyperliquid 数据流水线指南
+# Hyperliquid Data Pipeline Guide
 
-**状态**: ✅ 生产就绪 - 全部 6 个主题已验证
-**数据源模式**: 文件模式（基于节点数据文件的批次格式）
-**批次格式支持**: ✅ `_by_block` 文件的 Batch wrapper 解析
-**已知限制**:
-- ❌ **区块哈希不可用**: `replica_cmds` 文件不包含区块哈希，`hl.blocks.hash` 字段永远为空
-- ❌ **节点文件限制**: `node_trades` 目录不存在（trades 从 fills 中提取）
-- ✅ **交易哈希可用**: 所有其他主题（transactions、fills、orders、trades、misc_events）均包含哈希字段
-
----
-
-## 概要总结
-
-本指南记录了 Hyperliquid 区块链数据流式传输的完整流程，包含 6 个 Kafka 主题的数据采集、解析和验证。
-
-### 哈希字段可用性总结
-
-| 主题 | 哈希可用性 | 数据源 | 说明 |
-|------|----------|--------|------|
-| hl.blocks | ❌ **不可用** | replica_cmds 无区块哈希 | 永远为空字符串，需要 Explorer API 获取 |
-| hl.transactions | ✅ **可用** | `signed_action_bundles[i][0]` | 区块链共识生成的官方交易哈希 |
-| hl.fills | ✅ **可用** | node_fills_by_block | 交易哈希包含在 fill 数据中 |
-| hl.orders | ✅ **可用** | node_order_statuses_by_block | 订单关联的交易哈希 |
-| hl.trades | ✅ **可用** | 继承自 fills | 与 fill 相同的交易哈希 |
-| hl.misc_events | ✅ **可用** | misc_events_by_block | 事件关联的交易哈希 |
-
-**关键发现**:
-- ✅ **5/6 主题有哈希**: transactions、fills、orders、trades、misc_events 均包含完整的交易哈希
-- ❌ **仅区块哈希缺失**: 本地节点文件不包含区块哈希，这是唯一的限制
-- 💡 **获取区块哈希**: 如需区块哈希，必须使用 Hyperliquid Explorer WebSocket API (`explorerBlock`)
-
-### 关键特性
-
-✅ **完整的主题覆盖**: 所有 6 个主题已实现并验证
-✅ **批次格式支持**: `_by_block` 文件的 `{block_number, block_time, local_time, events: [...]}` 结构
-✅ **可配置性能限制**: 资源限制可通过 config.toml 配置
-✅ **智能文件选择**: 按修改时间排序（最新优先），确保监控活跃文件
-✅ **skip_historical 模式**: 仅处理新数据，从文件末尾开始
-✅ **MessagePack + JSONL 双格式支持**: blocks 用 MessagePack，其他用 JSONL
-⚠️ **区块哈希留空**: 所有本地数据源均无此字段 - 仅 Explorer RPC 可获取
-
-### 实现状态
-
-| 主题 | 状态 | 数据源 | 批次格式 | 验证 |
-|------|------|--------|---------|------|
-| hl.blocks | ✅ 已实现 | replica_cmds | 每行一个区块 | ✅ 128+ 记录 |
-| hl.transactions | ✅ 已实现 | replica_cmds | 每行一个区块 | ✅ 128+ 记录 |
-| hl.fills | ✅ 已实现 | node_fills_by_block | Batch wrapper | ✅ 248+ 记录 |
-| hl.orders | ✅ 已实现 | node_order_statuses_by_block | Batch wrapper | ✅ 162+ 记录 |
-| hl.trades | ✅ 已实现 | node_fills_by_block (聚合) | Batch wrapper | ✅ 248+ 记录 |
-| hl.misc_events | ✅ 已实现 | misc_events_by_block | Batch wrapper | ✅ 49+ 记录 |
-
-### 性能特性
-
-**可配置性能限制** (config.toml):
-- `max_concurrent_tailers` (默认: 64) - 限制并发文件处理任务
-- `skip_historical` (默认: false) - 从文件末尾开始，仅处理新数据
-
-**验证结果** (2025-11-25, skip_historical=true):
-- ✅ 全部 6 个主题成功发出记录
-- ✅ 实时处理新数据（skip_historical=true 工作正常）
-- ✅ 批次格式正确解析（block_number, block_time, events）
-- ✅ INFO 级别日志显示所有主题
+**Status**: Production Ready - All 6 topics verified
+**Architecture**: File mode + Redis hash lookup (ws-agent populates Redis)
+**Batch Format Support**: `_by_block` files with Batch wrapper parsing
+**Hash Status**:
+- **Block Hash**: via Redis (populated by ws-agent from Explorer WebSocket)
+- **Transaction Hash**: fills, orders, trades, misc_events all contain unique hashes
+- **transactions**: No unique hash (data source limitation, set to empty)
+- **Node file limitation**: `node_trades` directory does not exist (trades extracted from fills)
 
 ---
 
-## 数据源概览
+## Summary
 
-### 本地文件
+This guide documents the complete data streaming pipeline for Hyperliquid blockchain, covering data collection, parsing, and verification for 6 Kafka topics.
 
-| 文件 | 格式 | 批次结构 | 内容 |
-|------|------|---------|------|
-| replica_cmds | JSONL | 每行一个区块 | 区块元数据 + 交易和响应数据 |
-| node_fills_by_block | JSONL | **Batch wrapper** | 持仓填充（带 block_number） |
-| node_order_statuses_by_block | JSONL | **Batch wrapper** | 订单状态（带 block_number） |
-| misc_events_by_block | JSONL | **Batch wrapper** | 系统事件（带 block_number） |
-| ~~node_trades~~ | ❌ 不存在 | - | trades 从 fills 中提取 |
+### Hash Field Availability Summary
 
-### 批次格式 (Batch Wrapper)
+| Topic | Hash Status | Source | Notes |
+|-------|-------------|--------|-------|
+| hl.blocks | Available | Redis (ws-agent) | Real-time via Explorer WebSocket |
+| hl.transactions | Empty | - | Data source doesn't provide unique tx hash |
+| hl.fills | Available | node_fills_by_block | Unique transaction hash |
+| hl.orders | Available | node_order_statuses_by_block | Unique transaction hash |
+| hl.trades | Available | Inherited from fills | Unique transaction hash |
+| hl.misc_events | Available | misc_events_by_block | Unique transaction hash |
 
-`_by_block` 文件使用批次封装格式：
+**Key Findings**:
+- 5/6 topics have hashes: blocks (via Redis), fills, orders, trades, misc_events
+- transactions has no hash: `replica_cmds` only contains bundle hash (non-unique), set to empty to avoid confusion
+- Block hash: Retrieved from Redis (populated by ws-agent)
+
+### Key Features
+
+- **Complete Topic Coverage**: All 6 topics implemented and verified
+- **Batch Format Support**: `_by_block` files with `{block_number, block_time, local_time, events: [...]}` structure
+- **Configurable Performance Limits**: Resource limits configurable via config.toml
+- **Smart File Selection**: Sorted by modification time (newest first), ensures active files are monitored
+- **skip_historical Mode**: Process only new data, start from end of files
+- **MessagePack + JSONL Dual Format Support**: blocks use MessagePack, others use JSONL
+- **Redis Hash Lookup**: Block hashes retrieved from Redis (populated by ws-agent)
+
+### Implementation Status
+
+| Topic | Status | Source | Batch Format | Verified |
+|-------|--------|--------|--------------|----------|
+| hl.blocks | Implemented | replica_cmds | One block per line | 128+ records |
+| hl.transactions | Implemented | replica_cmds | One block per line | 128+ records |
+| hl.fills | Implemented | node_fills_by_block | Batch wrapper | 248+ records |
+| hl.orders | Implemented | node_order_statuses_by_block | Batch wrapper | 162+ records |
+| hl.trades | Implemented | node_fills_by_block (aggregation) | Batch wrapper | 248+ records |
+| hl.misc_events | Implemented | misc_events_by_block | Batch wrapper | 49+ records |
+
+### Performance Characteristics
+
+**Configurable Performance Limits** (config.toml):
+- `max_concurrent_tailers` (default: 64) - Limit concurrent file processing tasks
+- `skip_historical` (default: false) - Start from end of files, process only new data
+
+---
+
+## Data Source Overview
+
+### Local Files
+
+| File | Format | Batch Structure | Content |
+|------|--------|-----------------|---------|
+| replica_cmds | JSONL | One block per line | Block metadata + transaction and response data |
+| node_fills_by_block | JSONL | **Batch wrapper** | Position fills (with block_number) |
+| node_order_statuses_by_block | JSONL | **Batch wrapper** | Order status (with block_number) |
+| misc_events_by_block | JSONL | **Batch wrapper** | System events (with block_number) |
+| ~~node_trades~~ | Does not exist | - | trades extracted from fills |
+
+### Batch Format (Batch Wrapper)
+
+`_by_block` files use batch wrapper format:
 
 ```json
 {
@@ -87,83 +82,120 @@
   "block_time": "2025-11-25T08:33:18.111517886",
   "block_number": 807847463,
   "events": [
-    // 实际事件数据数组
+    // Actual event data array
     {"user": "0x...", "coin": "ETH", "px": "2896.9", ...},
     {"user": "0x...", "coin": "BTC", "px": "87351.0", ...}
   ]
 }
 ```
 
-**字段说明**:
-- `local_time`: 节点本地记录时间（ISO8601）
-- `block_time`: 区块链共识时间（ISO8601）
-- `block_number`: 真实区块高度（u64）
-- `events`: 事件数组（fills、orders、misc_events 等）
+**Field Description**:
+- `local_time`: Node local recording time (ISO8601)
+- `block_time`: Blockchain consensus time (ISO8601)
+- `block_number`: Real block height (u64)
+- `events`: Event array (fills, orders, misc_events, etc.)
 
-### 目录结构
+### Directory Structure
 
 ```
 ~/hl-data/
 ├── replica_cmds/
-│   └── 2025-11-24T09:08:24Z/         # 时间戳目录
+│   └── 2025-11-24T09:08:24Z/         # Timestamp directory
 │       └── 20251125/
-│           └── 807840000             # JSONL (每行一个区块)
+│           └── 807840000             # JSONL (one block per line)
 ├── node_fills_by_block/
 │   └── hourly/
 │       └── 20251125/
-│           └── 8                     # JSONL (批次格式)
+│           └── 8                     # JSONL (batch format)
 ├── node_order_statuses_by_block/
 │   └── hourly/
 │       └── 20251125/
-│           └── 8                     # JSONL (批次格式)
+│           └── 8                     # JSONL (batch format)
 └── misc_events_by_block/
     └── hourly/
         └── 20251125/
-            └── 8                     # JSONL (批次格式)
+            └── 8                     # JSONL (batch format)
 ```
+
+### replica_cmds File Structure Details
+
+**File Naming and Block Height Relationship**:
+
+```
+File path: replica_cmds/2025-11-26T04:53:40Z/20251126/808750000
+                                                      ↑
+                                                 Starting block height
+```
+
+**Line Number and Block Height Formula**:
+```
+Block Height = Filename + Line Number
+```
+
+| Line | Block Height | Calculation |
+|------|--------------|-------------|
+| Line 1 | 808750001 | 808750000 + 1 |
+| Line 100 | 808750100 | 808750000 + 100 |
+| Line 10000 | 808760000 | 808750000 + 10000 |
+
+**Round Number vs Block Height**:
+
+| Concept | Description | Example Value |
+|---------|-------------|---------------|
+| **Block Height** | Hyperliquid blockchain block height | 808,750,001 |
+| **Round Number** | CometBFT/Tendermint consensus round number | 1,087,330,263 |
+
+- Round != Block Height: Values are completely different (~278 million difference)
+- Round is an internal consensus mechanism identifier
+- Block Height is the publicly exposed blockchain block number
 
 ---
 
-## 主题映射
+## Topic Mapping
 
 ### 1. hl.blocks
 
-**数据源**: `replica_cmds/**/*/` (JSONL)
+**Data Source**: `replica_cmds/**/*/` (JSONL)
 
 **Schema**:
 ```json
 {
-  "height": 807847463,
+  "height": 808750001,
   "time": 1764059598111,
-  "hash": "",              // 不可用
+  "hash": "0x...",
   "proposer": "0x...",
-  "numTxs": 1285,
-  "round": 807847463
+  "numTxs": 1,
+  "round": 1087330263
 }
 ```
 
-**字段映射**:
-| 字段 | 来源 | 说明 |
-|------|------|------|
-| height | `abci_block.round` | 使用 round 作为 height |
-| time | `abci_block.time` | ISO8601→毫秒 |
-| hash | ❌ **永远为空** | `replica_cmds` 文件不包含区块哈希 |
-| proposer | `abci_block.proposer` | 区块提议者地址 |
-| numTxs | `signed_action_bundles.len()` | 交易计数 |
-| round | `abci_block.round` | ABCI 轮次号 |
+**Field Mapping**:
+| Field | Source | Notes |
+|-------|--------|-------|
+| height | **filename + line number** | Not round, calculated block height |
+| time | `abci_block.time` | ISO8601 -> milliseconds |
+| hash | **Redis (ws-agent)** | Retrieved from Redis cache |
+| proposer | `abci_block.proposer` | Block proposer address |
+| numTxs | `signed_action_bundles.len()` | Number of submitted bundles (not processed transactions) |
+| round | `abci_block.round` | CometBFT consensus round number (different from height!) |
 
-**哈希限制**:
-- ❌ **区块哈希不可用**: `replica_cmds` 数据源不包含区块哈希
-- 💡 **获取方式**: 如需区块哈希，必须使用 Explorer WebSocket API (`explorerBlock`)
-- 📝 **代码位置**: `blocks.rs:171` - 硬编码为空字符串
+**Important**: `round` and `height` are different values!
+- `round`: CometBFT internal consensus round number (e.g., 1,087,330,263)
+- `height`: Public blockchain block height (e.g., 808,750,001)
+- Calculation: `height = filename + line number`
 
-**状态**: ✅ 完成 | ⚠️ 区块哈希永远为空（数据源限制）
+**Hash Retrieval**:
+- Block hash retrieved from Redis
+- Redis populated by ws-agent (separate binary)
+- Key format: `block:{height}` -> hash
+
+**Status**: Complete
 
 ---
 
 ### 2. hl.transactions
 
-**数据源**: `replica_cmds/**/*` (JSONL)
+**Data Source**: `replica_cmds/**/*` (JSONL)
 
 **Schema**:
 ```json
@@ -180,34 +212,30 @@
 }
 ```
 
-**字段映射**:
-| 字段 | 来源 | 说明 |
-|------|------|------|
-| time | `abci_block.time` | ISO8601→毫秒 |
-| user | `resps.Full[i].user` | ✅ 从响应直接获取 |
-| hash | `signed_action_bundles[i].0` | ✅ **可用** - 共识生成的交易哈希 |
-| action | `signed_actions[i].action` | 完整 action 对象 |
-| block | `abci_block.round` | 使用 round 作为 block |
-| error | `resps.Full[i].res` | ✅ 从响应直接获取 |
+**Field Mapping**:
+| Field | Source | Notes |
+|-------|--------|-------|
+| time | `abci_block.time` | ISO8601 -> milliseconds |
+| user | `resps.Full[i].user` | Directly from response |
+| hash | - | **Set to empty** - data source doesn't provide unique hash |
+| action | `signed_actions[i].action` | Complete action object |
+| block | `abci_block.round` | Using round as block |
+| error | `resps.Full[i].res` | Directly from response |
 
-**哈希可用性**:
-- ✅ **交易哈希可用**: `replica_cmds` 数据包含交易哈希
-- 📝 **数据结构**: `signed_action_bundles` 是 tuple 数组 `[hash, bundle]`
-- 📝 **提取位置**: `transactions.rs:207-212` - `BundleWithHash(hash, bundle)` 解构
-- 💾 **存储位置**:
-  - Payload 中的 `hash` 字段
-  - DataRecord 的 `tx_hash` 元数据字段（line 239）
-- ℹ️ **说明**: 这是区块链共识生成的官方交易哈希
+**Hash Not Available**:
+- **Data source limitation**: `replica_cmds` only contains bundle hash (non-unique)
+- **Why set to empty**: Multiple transactions in the same bundle share the same hash, cannot uniquely identify individual transactions
+- **Alternative**: Use fills/orders data for unique transaction hashes
 
-**状态**: ✅ 完成
+**Status**: Complete
 
 ---
 
 ### 3. hl.fills
 
-**数据源**: `node_fills_by_block/**/*` (JSONL with Batch wrapper)
+**Data Source**: `node_fills_by_block/**/*` (JSONL with Batch wrapper)
 
-**Batch 结构示例**:
+**Batch Structure Example**:
 ```json
 {
   "local_time": "2025-11-25T08:33:18.508962742",
@@ -234,7 +262,7 @@
 }
 ```
 
-**输出 Schema** (tuple format):
+**Output Schema** (tuple format):
 ```json
 ["0x638b9e1f...", {
   "coin": "MON",
@@ -254,36 +282,31 @@
 }]
 ```
 
-**解析流程**:
-1. 解析 Batch wrapper，提取 `block_number`、`block_time`、`events`
-2. 遍历 `events` 数组（每个元素是 `[user, fill_details]` tuple）
-3. 注入 `block_height = batch.block_number`
-4. 输出为 tuple 格式：`[user, fillDetails]`
+**Parsing Flow**:
+1. Parse Batch wrapper, extract `block_number`, `block_time`, `events`
+2. Iterate `events` array (each element is `[user, fill_details]` tuple)
+3. Inject `block_height = batch.block_number`
+4. Output as tuple format: `[user, fillDetails]`
 
-**独有数据**:
-- ✅ **手续费**: 每笔交易的确切费用和币种
-- ✅ **盈亏**: 已实现盈亏（closedPnl）
-- ✅ **仓位跟踪**: startPosition、dir（方向变化）
-- ✅ **实际执行价格**: 包含滑点的真实成交价
-- ✅ **Maker/Taker**: crossed 标识流动性提供方
-- ✅ **Trade ID**: 唯一交易标识符（tid）
-- ✅ **Block Number**: 从 batch 中获取真实区块高度
-- ✅ **交易哈希**: fill 数据包含 tx hash
+**Unique Data**:
+- **Fees**: Exact fee and token for each trade
+- **PnL**: Realized PnL (closedPnl)
+- **Position Tracking**: startPosition, dir (direction change)
+- **Actual Execution Price**: Real fill price including slippage
+- **Maker/Taker**: crossed indicates liquidity provider
+- **Trade ID**: Unique trade identifier (tid)
+- **Block Number**: Real block height from batch
+- **Transaction Hash**: fill data contains tx hash
 
-**哈希可用性**:
-- ✅ **交易哈希可用**: `node_fills_by_block` 数据包含 hash 字段
-- 📝 **代码位置**: `fills.rs:98, 114` - 提取并规范化哈希
-- 💾 **存储位置**: 同时存储在 payload 和 DataRecord 的 `tx_hash` 元数据字段
-
-**状态**: ✅ 完成（支持 Batch 格式 + tuple 输出 + 哈希可用）
+**Status**: Complete (Batch format + tuple output + hash available)
 
 ---
 
 ### 4. hl.orders
 
-**数据源**: `node_order_statuses_by_block/**/*` (JSONL with Batch wrapper)
+**Data Source**: `node_order_statuses_by_block/**/*` (JSONL with Batch wrapper)
 
-**Batch 结构示例**:
+**Batch Structure Example**:
 ```json
 {
   "local_time": "2025-11-25T08:33:18.509256245",
@@ -312,7 +335,7 @@
 }
 ```
 
-**输出 Schema**:
+**Output Schema**:
 ```json
 {
   "user": "0x365e0c115f...",
@@ -327,31 +350,26 @@
 }
 ```
 
-**解析流程**:
-1. 解析 Batch wrapper，提取 `block_number`、`events`
-2. 遍历 `events` 数组
-3. 从 `order` 对象中提取字段并扁平化
-4. 注入 `block_height = batch.block_number`
+**Parsing Flow**:
+1. Parse Batch wrapper, extract `block_number`, `events`
+2. Iterate `events` array
+3. Extract fields from `order` object and flatten
+4. Inject `block_height = batch.block_number`
 
-**独有数据**:
-- ✅ **订单状态**: open/partial/filled/cancelled/rejected
-- ✅ **剩余数量**: sz（当前剩余）vs origSz（原始数量）
-- ✅ **订单生命周期**: 从创建到完成的状态变化历史
-- ✅ **Block Number**: 从 batch 中获取真实区块高度
-- ✅ **交易哈希**: order status 数据包含 tx hash
+**Unique Data**:
+- **Order Status**: open/partial/filled/cancelled/rejected
+- **Remaining Quantity**: sz (current remaining) vs origSz (original quantity)
+- **Order Lifecycle**: Status change history from creation to completion
+- **Block Number**: Real block height from batch
+- **Transaction Hash**: order status data contains tx hash
 
-**哈希可用性**:
-- ✅ **交易哈希可用**: `node_order_statuses_by_block` 数据包含 hash 字段
-- 📝 **数据来源**: 订单状态更新事件关联的交易哈希
-- 💾 **输出位置**: 包含在 payload 的 `hash` 字段中
-
-**状态**: ✅ 完成（支持 Batch 格式 + 字段扁平化 + 哈希可用）
+**Status**: Complete (Batch format + field flattening + hash available)
 
 ---
 
 ### 5. hl.trades
 
-**数据源**: `node_fills_by_block/**/*` (从 fills 中提取)
+**Data Source**: `node_fills_by_block/**/*` (extracted from fills)
 
 **Schema**:
 ```json
@@ -367,25 +385,22 @@
 }
 ```
 
-**提取逻辑**:
-- 从 fills 数据中提取 trade 信息
-- 1 个 crossed fill → 1 个 trade
-- 聚合买卖双方用户地址到 `users` 数组
+**Extraction Logic**:
+- Extract trade information from fills data
+- 1 crossed fill -> 1 trade
+- Aggregate buyer and seller addresses to `users` array
 
-**哈希可用性**:
-- ✅ **交易哈希可用**: 继承自 fills 数据的 hash 字段
-- 📝 **数据来源**: 从 `node_fills_by_block` 提取
-- 💾 **输出位置**: 包含在 trade payload 的 `hash` 字段中
+**Hash Available**: Inherited from fills data hash field
 
-**状态**: ✅ 完成（从 fills 提取，无需单独文件，哈希可用）
+**Status**: Complete (extracted from fills, no separate file needed, hash available)
 
 ---
 
 ### 6. hl.misc_events
 
-**数据源**: `misc_events_by_block/**/*` (JSONL with Batch wrapper)
+**Data Source**: `misc_events_by_block/**/*` (JSONL with Batch wrapper)
 
-**Batch 结构示例**:
+**Batch Structure Example**:
 ```json
 {
   "local_time": "2025-11-25T08:33:18.508962742",
@@ -406,7 +421,7 @@
 }
 ```
 
-**输出 Schema**:
+**Output Schema**:
 ```json
 {
   "time": "2025-11-25T08:33:18.111517886",
@@ -419,71 +434,191 @@
 }
 ```
 
-**解析流程**:
-1. 解析 Batch wrapper，提取 `block_number`、`events`
-2. 遍历 `events` 数组
-3. 从 `inner.user` 提取用户（如果存在）
-4. 注入 `block_height = batch.block_number`
+**Parsing Flow**:
+1. Parse Batch wrapper, extract `block_number`, `events`
+2. Iterate `events` array
+3. Extract user from `inner.user` (if present)
+4. Inject `block_height = batch.block_number`
 
-**哈希可用性**:
-- ✅ **交易哈希可用**: `misc_events_by_block` 数据包含 hash 字段
-- 📝 **数据来源**: 系统事件关联的交易哈希
-- 💾 **输出位置**: 包含在 payload 的 `hash` 字段中
+**Hash Available**: `misc_events_by_block` data contains hash field
 
-**状态**: ✅ 完成（支持 Batch 格式 + 哈希可用）
+**Status**: Complete (Batch format + hash available)
 
 ---
 
-## 完整数据流
+## Complete Data Flow
 
-### 数据源拓扑
+### Data Source Topology
 
 ```
 ┌─────────────────────────────────────────────────────────────────────────────┐
-│ Hyperliquid 节点文件                                                          │
+│ Hyperliquid Node Files                                                      │
 └─────────────────────────────────────────────────────────────────────────────┘
                         │
-                        ├── replica_cmds/* (JSONL, 每行一个区块)
-                        │   ├─> hl.blocks ✅
+                        ├── replica_cmds/* (JSONL, one block per line)
+                        │   ├─> hl.blocks
                         │   │   • height, time, proposer, numTxs
+                        │   │   • hash from Redis (ws-agent)
                         │   │
-                        │   └─> hl.transactions ✅ [REQUEST 层]
-                        │       • 全部 52 种交易类型
-                        │       • 用户原始请求参数
-                        │       • 错误信息
+                        │   └─> hl.transactions [REQUEST layer]
+                        │       • All 52 transaction types
+                        │       • User original request parameters
+                        │       • Error information
                         │
-                        ├── node_fills_by_block/* (JSONL, Batch 格式)
-                        │   ├─> hl.fills ✅ [OUTCOME 层]
-                        │   │   • 实际成交价格/数量
-                        │   │   • 手续费 + 盈亏
-                        │   │   • 仓位变化
-                        │   │   • block_number（真实区块高度）
+                        ├── node_fills_by_block/* (JSONL, Batch format)
+                        │   ├─> hl.fills [OUTCOME layer]
+                        │   │   • Actual fill price/quantity
+                        │   │   • Fees + PnL
+                        │   │   • Position changes
+                        │   │   • block_number (real block height)
                         │   │
-                        │   └─> hl.trades ✅
-                        │       • 交易撮合数据
-                        │       • 从 fills 中提取
+                        │   └─> hl.trades
+                        │       • Trade matching data
+                        │       • Extracted from fills
                         │
-                        ├── node_order_statuses_by_block/* (JSONL, Batch 格式)
-                        │   └─> hl.orders ✅ [STATE 层]
-                        │       • 订单状态 (open/partial/filled)
-                        │       • 剩余数量 vs 原始数量
-                        │       • block_number（真实区块高度）
+                        ├── node_order_statuses_by_block/* (JSONL, Batch format)
+                        │   └─> hl.orders [STATE layer]
+                        │       • Order status (open/partial/filled)
+                        │       • Remaining vs original quantity
+                        │       • block_number (real block height)
                         │
-                        └── misc_events_by_block/* (JSONL, Batch 格式)
-                            └─> hl.misc_events ✅
-                                • 系统事件
-                                • block_number（真实区块高度）
+                        └── misc_events_by_block/* (JSONL, Batch format)
+                            └─> hl.misc_events
+                                • System events
+                                • block_number (real block height)
 ```
 
 ---
 
-## 配置
+## Runtime Architecture
 
-### 代理配置 (config.toml)
+The system uses a two-binary architecture for clean separation of concerns:
+
+### Binary Overview
+
+| Binary | Purpose | Data Flow |
+|--------|---------|-----------|
+| **ws-agent** | WebSocket -> Redis | Subscribes to Explorer WS, stores block hashes in Redis |
+| **hl-agent** | Files -> gRPC/JSON | Reads node files, queries Redis for hashes, outputs records |
+
+### Architecture Diagram
+
+```
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                           System Architecture                                │
+├─────────────────────────────────────────────────────────────────────────────┤
+│                                                                             │
+│  ┌─────────────────┐                        ┌─────────────────┐            │
+│  │   ws-agent      │ ─────────────────────> │     Redis       │            │
+│  │ (Explorer WS)   │   block:{height}->hash │  (hash cache)   │            │
+│  └─────────────────┘                        └────────┬────────┘            │
+│         │                                            │                     │
+│         │ wss://rpc.hyperliquid.xyz/ws               │ GET block:{height}  │
+│         ▼                                            ▼                     │
+│  ┌─────────────────┐                        ┌─────────────────┐            │
+│  │ Hyperliquid     │                        │   hl-agent      │            │
+│  │ Explorer API    │                        │  (file mode)    │            │
+│  └─────────────────┘                        └────────┬────────┘            │
+│                                                      │                     │
+│                                                      ▼                     │
+│                                             ┌─────────────────┐            │
+│  ┌─────────────────┐                        │  File Watchers  │            │
+│  │ Hyperliquid     │ ──────────────────────>│  + Tailers      │            │
+│  │ Node Files      │   replica_cmds, etc.   └────────┬────────┘            │
+│  └─────────────────┘                                 │                     │
+│                                                      ▼                     │
+│                                             ┌─────────────────┐            │
+│                                             │  gRPC Sorter    │            │
+│                                             │  or JSON Files  │            │
+│                                             └─────────────────┘            │
+│                                                                             │
+└─────────────────────────────────────────────────────────────────────────────┘
+```
+
+### ws-agent
+
+Standalone binary that:
+1. Connects to Hyperliquid Explorer WebSocket (`wss://rpc.hyperliquid.xyz/ws`)
+2. Subscribes to `explorerBlock` channel
+3. Stores block hashes in Redis with TTL (key format: `block:{height}`)
+4. Runs independently of hl-agent
+
+**Usage**:
+```bash
+./target/release/ws_agent \
+    --ws-url wss://rpc.hyperliquid.xyz/ws \
+    --redis-url redis://127.0.0.1:6379 \
+    --ttl 86400
+```
+
+### hl-agent
+
+Main data processing binary that:
+1. Watches Hyperliquid node files for changes
+2. Tails files incrementally with checkpoint recovery
+3. Parses data into 6 Kafka topics
+4. Queries Redis for block hashes (populated by ws-agent)
+5. Outputs to gRPC sorter or JSON files
+
+**Usage**:
+```bash
+HL_AGENT_CONFIG=config.toml ./target/release/hl-agent
+```
+
+### Module Structure
+
+```
+src/
+├── main.rs                 # Entry point
+├── runner/
+│   ├── mod.rs              # Shared types and utilities
+│   └── file_mode.rs        # File mode runner
+├── parsers/
+│   ├── mod.rs              # Parser routing
+│   ├── batch.rs            # Generic batch wrapper BatchEnvelope<T>
+│   ├── buffered.rs         # Buffered line parser abstraction
+│   ├── schemas.rs          # Shared output schemas (Block, Transaction)
+│   ├── block_merger.rs     # Block hash merger
+│   ├── hash_store.rs       # Redis hash lookup
+│   └── [topic parsers]     # fills, orders, trades, misc_events, etc.
+├── config.rs               # Configuration management
+├── checkpoint.rs           # Progress checkpointing
+├── tailer.rs               # File tailer
+├── watcher.rs              # File system watcher
+├── sources/
+│   └── mod.rs              # Data sources module
+└── bin/
+    └── ws_agent.rs         # WebSocket agent binary
+```
+
+### HashStore Component
+
+HashStore provides block hash lookup via Redis:
+
+```
+┌───────────────────────────────────────────────────┐
+│                   HashStore                        │
+├───────────────────────────────────────────────────┤
+│  Layer 1: LRU Cache (Memory)                      │
+│  ├── Capacity: 100,000 entries                    │
+│  ├── Access: O(1)                                 │
+│  └── Purpose: Hot data fast access                │
+├───────────────────────────────────────────────────┤
+│  Layer 2: Redis (Network)                         │
+│  ├── Key: block:{height}                          │
+│  ├── Value: hash string                           │
+│  └── Purpose: Shared cache populated by ws-agent  │
+└───────────────────────────────────────────────────┘
+```
+
+**Data Flow**:
+1. ws-agent receives `explorerBlock` -> writes to Redis
+2. hl-agent queries HashStore -> checks LRU cache first -> falls back to Redis
+3. Cache miss returns empty hash (block may be too old)
+
+### Configuration Example
 
 ```toml
-mode = "file"
-
 [node]
 node_id = "hl-agent-1"
 data_dir = "~/hl-data"
@@ -496,83 +631,69 @@ watch_paths = [
     "misc_events_by_block"
 ]
 poll_interval_ms = 100
-skip_historical = true    # 从文件末尾开始，仅处理新数据
+skip_historical = true
 
 [sorter]
-endpoint = "http://127.0.0.1:50051"  # gRPC 模式
-# output_dir = "/tmp/output"         # 或使用文件模式
+endpoint = "http://127.0.0.1:50051"
 batch_size = 100
 
 [checkpoint]
 db_path = "~/.hl-agent/checkpoint.db"
+redis_url = "redis://127.0.0.1:6379"
 ```
 
-**注意**:
-- ❌ `node_trades` 已从 watch_paths 移除（目录不存在，trades 从 fills 提取）
-- ✅ 使用 `_by_block` 变体以获取 block_number 元数据
+### Performance Characteristics
+
+| Metric | Description |
+|--------|-------------|
+| Block Hash | Retrieved from Redis (populated by ws-agent) |
+| Startup Delay | ~1s (Redis connection) |
+| Memory Usage | ~5MB (LRU cache, 100,000 entries) |
+| Network Dependency | Redis connection required |
+| Cache Miss | Returns empty hash |
 
 ---
 
-## Checkpoint 机制
+## Checkpoint Mechanism
 
-**数据库**: SQLite with WAL mode (`~/.hl-agent/checkpoint.db`)
+**Database**: SQLite with WAL mode (`~/.hl-agent/checkpoint.db`)
 
-**安全 Offset 计算**:
-- 公式: `safe_offset = current_offset + chunk.len() - parser.backlog_len()`
-- 从数据库更新 checkpoint 为 safe_offset
+**Safe Offset Calculation**:
+- Formula: `safe_offset = current_offset + chunk.len() - parser.backlog_len()`
+- Update checkpoint in database to safe_offset
 
-**为什么重要**:
-- Parser buffer 可能包含不完整的行/Batch
-- Checkpoint 必须指向最后**完全处理**的字节
-- 重启时从 checkpoint 安全恢复，无数据丢失
-
----
-
-## 测试验证总结 (2025-11-25)
-
-### 压力测试结果
-
-**测试配置**:
-- 配置: `skip_historical = true`（仅处理新数据）
-- 并发 tailers: 68 个文件同时处理
-- 日志级别: INFO（所有主题可见）
-
-**验证结果**:
-| 主题 | 记录数 | 状态 |
-|------|--------|------|
-| hl.blocks | 128+ | ✅ 工作正常 |
-| hl.transactions | 128+ | ✅ 工作正常 |
-| hl.fills | 248+ | ✅ 工作正常 |
-| hl.trades | 248+ | ✅ 工作正常 |
-| hl.orders | 162+ | ✅ 工作正常 |
-| hl.misc_events | 49+ | ✅ 工作正常 |
-
-**关键验证**:
-- ✅ Batch 格式正确解析（block_number, block_time, events）
-- ✅ skip_historical=true 正确工作（从文件末尾开始）
-- ✅ 实时处理新数据（timestamps: 2025-11-25 08:33:18）
-- ✅ 所有主题在 INFO 级别可见
-- ✅ Fills 输出为 tuple 格式：`[user, fillDetails]`
-- ✅ Orders 字段正确扁平化
+**Why Important**:
+- Parser buffer may contain incomplete lines/Batches
+- Checkpoint must point to last **fully processed** byte
+- Resume safely from checkpoint on restart, no data loss
 
 ---
 
-## 构建和部署
+## Build and Deploy
 
-### 前置条件
+### Prerequisites
 ```bash
 sudo apt-get install protobuf-compiler  # Debian/Ubuntu
 brew install protobuf                    # macOS
 ```
 
-### 构建
+### Build
 ```bash
 cd hl-agent
 cargo build --release
-# 输出: target/release/hl-agent
+# Output: target/release/hl-agent, target/release/ws_agent
 ```
 
-### 运行
+### Run
+
+**Start ws-agent first** (populates Redis):
+```bash
+./target/release/ws_agent \
+    --ws-url wss://rpc.hyperliquid.xyz/ws \
+    --redis-url redis://127.0.0.1:6379
+```
+
+**Then start hl-agent**:
 ```bash
 export RUST_LOG=info
 HL_AGENT_CONFIG=config.toml ./target/release/hl-agent
@@ -580,17 +701,30 @@ HL_AGENT_CONFIG=config.toml ./target/release/hl-agent
 
 ---
 
-## 参考文档
+## Reference Documentation
 
-- `CLAUDE.md` - 项目概览
-- `ORDER_BOOK_SERVER_ANALYSIS.md` - 批次格式分析（发现 Batch wrapper 结构）
-- `ALLIUM_COMPARISON.md` - Allium schema 对比
-- `REVIEW_REPORT_NOV_2025.md` - 2025-11 代码审查报告
-- `examples/mock_sorter.rs` - 测试基础设施
-- `examples/verify_schemas.rs` - Schema 验证工具
+- `CLAUDE.md` - Project overview
+- `ORDER_BOOK_SERVER_ANALYSIS.md` - Batch format analysis (discovered Batch wrapper structure)
+- `ALLIUM_COMPARISON.md` - Allium schema comparison
+- `examples/mock_sorter.rs` - Test infrastructure
+
+### Key Code Paths
+
+| Function | File Path |
+|----------|-----------|
+| Entry point | `src/main.rs` |
+| File mode runner | `src/runner/file_mode.rs` |
+| Parser routing | `src/parsers/mod.rs` |
+| Shared output schemas | `src/parsers/schemas.rs` |
+| Batch wrapper generic | `src/parsers/batch.rs` |
+| Buffered line parser | `src/parsers/buffered.rs` |
+| Block hash merger | `src/parsers/block_merger.rs` |
+| Hash store (Redis) | `src/parsers/hash_store.rs` |
+| WebSocket agent | `src/bin/ws_agent.rs` |
 
 ---
 
-**文档版本**: v6.0
-**最后更新**: 2025-11-25
-**状态**: ✅ 生产就绪 - 全部 6 个主题已验证（含 Batch 格式支持）
+**Document Version**: v9.0
+**Last Updated**: 2025-11-27
+**Status**: Production Ready - All 6 topics verified (file mode + Redis hash lookup)
+**Architecture**: Two-binary system (ws-agent + hl-agent)

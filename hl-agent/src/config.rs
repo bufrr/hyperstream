@@ -1,12 +1,26 @@
+//! Configuration management for the hl-agent.
+//!
+//! Loads and validates configuration from TOML files.
+
 use anyhow::Result;
 use serde::Deserialize;
 use std::fs;
 use std::path::{Path, PathBuf};
 
+// Default values as constants
+const DEFAULT_POLL_INTERVAL_MS: u64 = 100;
+const DEFAULT_BATCH_SIZE: usize = 100;
+const DEFAULT_SKIP_HISTORICAL: bool = true;
+const DEFAULT_TAIL_BYTES: u64 = 0;
+const DEFAULT_MAX_CONCURRENT_TAILERS: usize = 64;
+const DEFAULT_BULK_LOAD_WARN_BYTES: u64 = 500 * 1024 * 1024; // 500 MiB
+const DEFAULT_BULK_LOAD_ABORT_BYTES: u64 = 1024 * 1024 * 1024; // 1 GiB
+const DEFAULT_REDIS_URL: &str = "redis://127.0.0.1:6379";
+const DEFAULT_SINK_RETRY_MAX_ATTEMPTS: usize = 5;
+const DEFAULT_SINK_RETRY_BASE_DELAY_MS: u64 = 500;
+
 #[derive(Debug, Deserialize, Clone)]
 pub struct Config {
-    #[serde(default)]
-    pub mode: SourceMode,
     #[serde(default)]
     pub node: NodeConfig,
     #[serde(default)]
@@ -16,38 +30,14 @@ pub struct Config {
     pub checkpoint: CheckpointConfig,
     #[serde(default)]
     pub performance: PerformanceConfig,
-    #[serde(default)]
-    pub explorer_ws: Option<ExplorerWsConfig>,
 }
 
-#[derive(Debug, Deserialize, Clone, Copy, PartialEq, Eq)]
-#[serde(rename_all = "lowercase")]
-pub enum SourceMode {
-    File,
-    Websocket,
-}
-
-impl Default for SourceMode {
-    fn default() -> Self {
-        SourceMode::File
-    }
-}
-
-#[derive(Debug, Deserialize, Clone)]
+#[derive(Debug, Deserialize, Clone, Default)]
 pub struct NodeConfig {
     #[serde(default)]
     pub node_id: String,
     #[serde(default)]
     pub data_dir: String,
-}
-
-impl Default for NodeConfig {
-    fn default() -> Self {
-        Self {
-            node_id: String::new(),
-            data_dir: String::new(),
-        }
-    }
 }
 
 #[derive(Debug, Deserialize, Clone)]
@@ -56,11 +46,12 @@ pub struct WatcherConfig {
     pub watch_paths: Vec<String>,
     #[serde(default = "default_poll_interval_ms")]
     pub poll_interval_ms: u64,
-    /// Skip historical data and only process new data after startup (DEFAULT: true)
-    /// - true: Start from end of existing files (prevents OOM when many historical files exist)
-    /// - false: Process all data from the beginning (use for backfilling)
+    /// Skip historical data when starting (DEFAULT: true)
     #[serde(default = "default_skip_historical")]
     pub skip_historical: bool,
+    /// When skip_historical=true, read the last N bytes of each existing file (DEFAULT: 0)
+    #[serde(default = "default_tail_bytes")]
+    pub tail_bytes: u64,
 }
 
 impl Default for WatcherConfig {
@@ -69,6 +60,7 @@ impl Default for WatcherConfig {
             watch_paths: Vec::new(),
             poll_interval_ms: DEFAULT_POLL_INTERVAL_MS,
             skip_historical: DEFAULT_SKIP_HISTORICAL,
+            tail_bytes: DEFAULT_TAIL_BYTES,
         }
     }
 }
@@ -87,80 +79,31 @@ pub struct SorterConfig {
 pub struct CheckpointConfig {
     #[serde(default)]
     pub db_path: String,
-    #[allow(dead_code)]
-    #[serde(default = "default_update_interval_records")]
-    pub update_interval_records: u64,
+    #[serde(default = "default_redis_url")]
+    pub redis_url: String,
 }
 
 impl Default for CheckpointConfig {
     fn default() -> Self {
         Self {
             db_path: String::new(),
-            update_interval_records: DEFAULT_UPDATE_INTERVAL_RECORDS,
+            redis_url: default_redis_url(),
         }
     }
 }
 
 #[derive(Debug, Deserialize, Clone)]
 pub struct PerformanceConfig {
-    /// Maximum number of concurrent file tailer tasks (default: 64)
     #[serde(default = "default_max_concurrent_tailers")]
     pub max_concurrent_tailers: usize,
-    /// Warn when bulk-loading files exceed this size (default: 500 MiB)
     #[serde(default = "default_bulk_load_warn_bytes")]
     pub bulk_load_warn_bytes: u64,
-    /// Abort bulk-loading when files exceed this size (default: 1 GiB)
     #[serde(default = "default_bulk_load_abort_bytes")]
     pub bulk_load_abort_bytes: u64,
-}
-
-#[derive(Debug, Deserialize, Clone)]
-pub struct ExplorerWsConfig {
-    /// Hyperliquid Explorer WebSocket URL (for real-time blocks and transactions)
-    /// Default: wss://rpc.hyperliquid.xyz/ws (mainnet)
-    #[serde(default = "default_explorer_ws_url")]
-    pub url: String,
-}
-
-const DEFAULT_POLL_INTERVAL_MS: u64 = 100;
-const DEFAULT_BATCH_SIZE: usize = 100;
-const DEFAULT_UPDATE_INTERVAL_RECORDS: u64 = 1_000;
-const DEFAULT_SKIP_HISTORICAL: bool = true;
-const DEFAULT_MAX_CONCURRENT_TAILERS: usize = 64;
-const DEFAULT_BULK_LOAD_WARN_BYTES: u64 = 500 * 1024 * 1024; // 500 MiB
-const DEFAULT_BULK_LOAD_ABORT_BYTES: u64 = 1024 * 1024 * 1024; // 1 GiB
-const DEFAULT_EXPLORER_WS_URL: &str = "wss://rpc.hyperliquid.xyz/ws";
-
-fn default_poll_interval_ms() -> u64 {
-    DEFAULT_POLL_INTERVAL_MS
-}
-
-fn default_batch_size() -> usize {
-    DEFAULT_BATCH_SIZE
-}
-
-fn default_update_interval_records() -> u64 {
-    DEFAULT_UPDATE_INTERVAL_RECORDS
-}
-
-fn default_skip_historical() -> bool {
-    DEFAULT_SKIP_HISTORICAL
-}
-
-fn default_max_concurrent_tailers() -> usize {
-    DEFAULT_MAX_CONCURRENT_TAILERS
-}
-
-fn default_bulk_load_warn_bytes() -> u64 {
-    DEFAULT_BULK_LOAD_WARN_BYTES
-}
-
-fn default_bulk_load_abort_bytes() -> u64 {
-    DEFAULT_BULK_LOAD_ABORT_BYTES
-}
-
-fn default_explorer_ws_url() -> String {
-    DEFAULT_EXPLORER_WS_URL.to_string()
+    #[serde(default = "default_sink_retry_max_attempts")]
+    pub sink_retry_max_attempts: usize,
+    #[serde(default = "default_sink_retry_base_delay_ms")]
+    pub sink_retry_base_delay_ms: u64,
 }
 
 impl Default for PerformanceConfig {
@@ -169,14 +112,55 @@ impl Default for PerformanceConfig {
             max_concurrent_tailers: DEFAULT_MAX_CONCURRENT_TAILERS,
             bulk_load_warn_bytes: DEFAULT_BULK_LOAD_WARN_BYTES,
             bulk_load_abort_bytes: DEFAULT_BULK_LOAD_ABORT_BYTES,
+            sink_retry_max_attempts: DEFAULT_SINK_RETRY_MAX_ATTEMPTS,
+            sink_retry_base_delay_ms: DEFAULT_SINK_RETRY_BASE_DELAY_MS,
         }
     }
+}
+
+// Serde default functions (must be regular fn, not const fn)
+fn default_poll_interval_ms() -> u64 {
+    DEFAULT_POLL_INTERVAL_MS
+}
+fn default_batch_size() -> usize {
+    DEFAULT_BATCH_SIZE
+}
+fn default_skip_historical() -> bool {
+    DEFAULT_SKIP_HISTORICAL
+}
+fn default_tail_bytes() -> u64 {
+    DEFAULT_TAIL_BYTES
+}
+fn default_max_concurrent_tailers() -> usize {
+    DEFAULT_MAX_CONCURRENT_TAILERS
+}
+fn default_bulk_load_warn_bytes() -> u64 {
+    DEFAULT_BULK_LOAD_WARN_BYTES
+}
+fn default_bulk_load_abort_bytes() -> u64 {
+    DEFAULT_BULK_LOAD_ABORT_BYTES
+}
+fn default_sink_retry_max_attempts() -> usize {
+    DEFAULT_SINK_RETRY_MAX_ATTEMPTS
+}
+fn default_sink_retry_base_delay_ms() -> u64 {
+    DEFAULT_SINK_RETRY_BASE_DELAY_MS
+}
+fn default_redis_url() -> String {
+    DEFAULT_REDIS_URL.to_string()
 }
 
 impl Config {
     pub fn load(path: impl AsRef<Path>) -> Result<Self> {
         let raw = fs::read_to_string(path.as_ref())?;
         let config: Config = toml::from_str(&raw)?;
+
+        config.validate()?;
+        Ok(config)
+    }
+
+    pub fn validate(&self) -> Result<()> {
+        let config = self;
 
         let has_endpoint = config
             .sorter
@@ -205,25 +189,24 @@ impl Config {
             anyhow::bail!("node.node_id cannot be empty");
         }
 
-        match config.mode {
-            SourceMode::File => {
-                if config.node.data_dir.trim().is_empty() {
-                    anyhow::bail!("node.data_dir cannot be empty in file mode");
-                }
-                if config.watcher.watch_paths.is_empty() {
-                    anyhow::bail!("watch_paths cannot be empty in file mode");
-                }
-                if config.checkpoint.db_path.trim().is_empty() {
-                    anyhow::bail!("checkpoint.db_path must be set in file mode");
-                }
-            }
-            SourceMode::Websocket => {
-                if config.explorer_ws.is_none() {
-                    anyhow::bail!("explorer_ws configuration is required in websocket mode");
-                }
-            }
+        if config.node.data_dir.trim().is_empty() {
+            anyhow::bail!("node.data_dir cannot be empty");
         }
-        Ok(config)
+        if config.watcher.watch_paths.is_empty() {
+            anyhow::bail!("watch_paths cannot be empty");
+        }
+        if config.checkpoint.db_path.trim().is_empty() {
+            anyhow::bail!("checkpoint.db_path must be set");
+        }
+        if config.performance.bulk_load_warn_bytes >= config.performance.bulk_load_abort_bytes {
+            anyhow::bail!(
+                "performance.bulk_load_warn_bytes ({}) must be less than performance.bulk_load_abort_bytes ({})",
+                config.performance.bulk_load_warn_bytes,
+                config.performance.bulk_load_abort_bytes
+            );
+        }
+
+        Ok(())
     }
 
     pub fn expand_data_dir(&self) -> PathBuf {
@@ -251,8 +234,16 @@ impl Config {
         PathBuf::from(expanded.as_ref())
     }
 
+    pub fn redis_url(&self) -> String {
+        self.checkpoint.redis_url.clone()
+    }
+
     pub fn skip_historical(&self) -> bool {
         self.watcher.skip_historical
+    }
+
+    pub fn tail_bytes(&self) -> u64 {
+        self.watcher.tail_bytes
     }
 }
 

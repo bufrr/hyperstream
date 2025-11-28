@@ -1,6 +1,8 @@
+use crate::parsers::batch::BatchEnvelope;
+use crate::parsers::utils::deserialize_option_string;
 use crate::parsers::{
     drain_complete_lines, line_preview, normalize_tx_hash, parse_iso8601_to_millis,
-    partition_key_or_unknown, trim_line_bytes, Parser,
+    partition_key_or_unknown, trim_line_bytes, Parser, LINE_PREVIEW_LIMIT,
 };
 use crate::sorter_client::proto::DataRecord;
 use anyhow::{Context, Result};
@@ -8,8 +10,6 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::path::Path;
 use tracing::warn;
-
-const LINE_PREVIEW_LIMIT: usize = 256;
 
 /// Parses `node_order_statuses` JSON lines and produces `hl.orders` status snapshots.
 ///
@@ -58,18 +58,6 @@ struct OrderFieldValues {
 }
 
 #[derive(Deserialize)]
-struct NodeOrderBatch {
-    #[serde(alias = "blockNumber", alias = "block_number", alias = "block_height")]
-    block_number: u64,
-    #[serde(alias = "blockTime", alias = "block_time", default)]
-    block_time: Option<String>,
-    #[serde(default, alias = "round", alias = "height")]
-    _round: Option<u64>,
-    #[serde(default, deserialize_with = "deserialize_node_order_events")]
-    events: Vec<NodeOrderStatus>,
-}
-
-#[derive(Deserialize)]
 struct NodeOrderStatus {
     #[serde(default)]
     user: String,
@@ -95,7 +83,7 @@ impl Parser for OrdersParser {
                 continue;
             }
 
-            if let Ok(batch) = serde_json::from_slice::<NodeOrderBatch>(&line) {
+            if let Ok(batch) = serde_json::from_slice::<BatchEnvelope<NodeOrderStatus>>(&line) {
                 let block_number = batch.block_number;
                 for event in batch.events {
                     records.push(order_status_to_record(
@@ -248,56 +236,12 @@ fn value_to_string(value: &Value) -> Option<String> {
     }
 }
 
-fn deserialize_node_order_events<'de, D>(deserializer: D) -> Result<Vec<NodeOrderStatus>, D::Error>
-where
-    D: serde::Deserializer<'de>,
-{
-    let value = Option::<Value>::deserialize(deserializer)?;
-    match value {
-        None | Some(Value::Null) => Ok(Vec::new()),
-        Some(Value::Array(arr)) => arr
-            .into_iter()
-            .map(|item| serde_json::from_value(item).map_err(serde::de::Error::custom))
-            .collect(),
-        Some(Value::Object(map)) => map
-            .into_iter()
-            .map(|(_, item)| serde_json::from_value(item).map_err(serde::de::Error::custom))
-            .collect(),
-        Some(other) => Err(serde::de::Error::custom(format!(
-            "expected events list or object, got {other:?}"
-        ))),
-    }
-}
-
-fn deserialize_option_string<'de, D>(deserializer: D) -> Result<Option<String>, D::Error>
-where
-    D: serde::Deserializer<'de>,
-{
-    let value = Option::<Value>::deserialize(deserializer)?;
-    match value {
-        None | Some(Value::Null) => Ok(None),
-        Some(Value::String(s)) => {
-            let trimmed = s.trim();
-            if trimmed.is_empty() {
-                Ok(None)
-            } else {
-                Ok(Some(trimmed.to_string()))
-            }
-        }
-        Some(Value::Number(num)) => Ok(Some(num.to_string())),
-        Some(Value::Bool(b)) => Ok(Some(b.to_string())),
-        Some(other) => Err(serde::de::Error::custom(format!(
-            "expected string, got {other:?}"
-        ))),
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
 
     #[test]
-    fn node_order_batch_accepts_object_events() {
+    fn batch_envelope_accepts_object_events() {
         let json = r#"
         {
             "block_number": 10,
@@ -316,7 +260,8 @@ mod tests {
         }
         "#;
 
-        let batch: NodeOrderBatch = serde_json::from_str(json).expect("should parse");
+        let batch: BatchEnvelope<NodeOrderStatus> =
+            serde_json::from_str(json).expect("should parse");
         assert_eq!(batch.events.len(), 1);
         assert_eq!(batch.events[0].user, "alice");
     }

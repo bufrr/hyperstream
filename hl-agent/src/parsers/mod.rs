@@ -2,31 +2,30 @@ use crate::sorter_client::proto::DataRecord;
 use anyhow::{anyhow, Result};
 use std::path::Path;
 
+pub mod batch;
+pub mod block_merger;
 pub mod blocks;
+pub mod buffered;
 mod fill_types;
 pub mod fills;
+pub mod hash_store;
 pub mod misc_events;
 pub mod orders;
+pub mod schemas;
 pub mod trades;
 pub mod transactions;
 mod utils;
 
-// Explorer WebSocket parsers
-pub mod explorer_blocks;
-pub mod explorer_txs;
-
+pub use buffered::{BufferedLineParser, LineParser};
 pub(crate) use utils::*;
+pub use utils::{current_timestamp, LINE_PREVIEW_LIMIT};
 
 pub use blocks::BlocksParser;
-pub use fills::FillsParser;
-pub use misc_events::MiscEventsParser;
+pub use fills::new_fills_parser;
+pub use misc_events::new_misc_events_parser;
 pub use orders::OrdersParser;
 pub use trades::TradesParser;
 pub use transactions::TransactionsParser;
-
-// Export Explorer parsers
-pub use explorer_blocks::ExplorerBlocksParser;
-pub use explorer_txs::ExplorerTxsParser;
 
 /// State machine that converts file fragments produced by the tailer into `DataRecord`s.
 ///
@@ -36,7 +35,7 @@ pub use explorer_txs::ExplorerTxsParser;
 ///
 /// # Examples
 ///
-/// ```
+/// ```ignore
 /// # use anyhow::Result;
 /// use hl_agent::parsers::{BlocksParser, Parser};
 /// use std::path::Path;
@@ -98,7 +97,7 @@ pub fn route_parser(file_path: &Path) -> Result<Vec<Box<dyn Parser>>> {
     if path_contains(file_path, "node_fills_by_block") {
         // Fill data generates both hl.fills (position fills) and hl.trades (aggregated trades)
         return Ok(vec![
-            Box::new(FillsParser::default()),
+            Box::new(new_fills_parser()),
             Box::new(TradesParser::default()),
         ]);
     }
@@ -110,7 +109,7 @@ pub fn route_parser(file_path: &Path) -> Result<Vec<Box<dyn Parser>>> {
     }
 
     if path_contains(file_path, "misc_events") || path_contains(file_path, "misc_events_by_block") {
-        return Ok(vec![Box::new(MiscEventsParser::default())]);
+        return Ok(vec![Box::new(new_misc_events_parser())]);
     }
 
     Err(anyhow!(

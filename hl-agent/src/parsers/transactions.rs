@@ -1,7 +1,8 @@
 use crate::parsers::blocks::{proposer_cache, SharedProposerCache};
+use crate::parsers::utils::extract_starting_block;
 use crate::parsers::{
     drain_complete_lines, line_preview, parse_iso8601_to_millis, partition_key_or_unknown,
-    trim_line_bytes, Parser,
+    trim_line_bytes, Parser, LINE_PREVIEW_LIMIT,
 };
 use crate::sorter_client::proto::DataRecord;
 use anyhow::{Context, Result};
@@ -10,15 +11,19 @@ use serde_json::Value;
 use std::path::Path;
 use tracing::warn;
 
-const LINE_PREVIEW_LIMIT: usize = 256;
-
 /// Decodes `replica_cmds` lines containing blocks and responses into `hl.transactions` records.
 ///
 /// The parser aligns signed actions with execution responses, emits a `DataRecord` per transaction,
 /// and keeps track of proposer data shared with the blocks parser.
+///
+/// Block height is calculated as: `starting_block (from filename) + line_number`
 pub struct TransactionsParser {
     buffer: Vec<u8>,
     proposer_cache: SharedProposerCache,
+    /// Starting block number extracted from filename (e.g., 808750000 from ".../808750000")
+    starting_block: Option<u64>,
+    /// Current line count within the file (0-indexed, first line = block at starting_block)
+    line_count: u64,
 }
 
 #[derive(Serialize)]
@@ -110,12 +115,25 @@ impl Default for TransactionsParser {
         Self {
             buffer: Vec::new(),
             proposer_cache: proposer_cache(),
+            starting_block: None,
+            line_count: 0,
         }
     }
 }
 
 impl Parser for TransactionsParser {
-    fn parse(&mut self, _file_path: &Path, data: &[u8]) -> Result<Vec<DataRecord>> {
+    fn parse(&mut self, file_path: &Path, data: &[u8]) -> Result<Vec<DataRecord>> {
+        // Extract starting block from filename on first call
+        if self.starting_block.is_none() {
+            self.starting_block = extract_starting_block(file_path);
+            if self.starting_block.is_none() {
+                warn!(
+                    file_path = %file_path.display(),
+                    "could not extract starting block from filename, falling back to round"
+                );
+            }
+        }
+
         self.buffer.extend_from_slice(data);
         let lines = drain_complete_lines(&mut self.buffer);
         let mut records = Vec::new();
@@ -123,12 +141,16 @@ impl Parser for TransactionsParser {
         for (line_idx, raw_line) in lines.into_iter().enumerate() {
             let line = trim_line_bytes(raw_line);
             if line.is_empty() {
+                self.line_count += 1;
                 continue;
             }
 
+            // Calculate block height: starting_block + line_count
+            let calculated_height = self.starting_block.map(|start| start + self.line_count);
+
             match serde_json::from_slice::<ReplicaCmd>(&line) {
                 Ok(cmd) => {
-                    self.process_replica_cmd(cmd, &mut records)?;
+                    self.process_replica_cmd(cmd, calculated_height, &mut records)?;
                 }
                 Err(err) => {
                     warn!(
@@ -139,6 +161,8 @@ impl Parser for TransactionsParser {
                     );
                 }
             }
+
+            self.line_count += 1;
         }
 
         Ok(records)
@@ -150,7 +174,12 @@ impl Parser for TransactionsParser {
 }
 
 impl TransactionsParser {
-    fn process_replica_cmd(&self, cmd: ReplicaCmd, records: &mut Vec<DataRecord>) -> Result<()> {
+    fn process_replica_cmd(
+        &self,
+        cmd: ReplicaCmd,
+        calculated_height: Option<u64>,
+        records: &mut Vec<DataRecord>,
+    ) -> Result<()> {
         let ReplicaCmd { abci_block, resps } = cmd;
         let AbciBlock {
             time,
@@ -159,11 +188,12 @@ impl TransactionsParser {
             signed_action_bundles,
         } = abci_block;
 
-        if !(round == 0 || proposer.is_empty()) {
-            self.proposer_cache.insert(round, proposer);
-        }
+        // Use calculated height, fall back to round if filename parsing failed
+        let block_height = calculated_height.unwrap_or(round);
 
-        let block_height = round;
+        if !(block_height == 0 || proposer.is_empty()) {
+            self.proposer_cache.insert(block_height, proposer);
+        }
 
         let timestamp = parse_iso8601_to_millis(&time).unwrap_or(0);
         let actions_with_hashes = flatten_actions_with_hashes(signed_action_bundles);
@@ -181,18 +211,19 @@ impl TransactionsParser {
         }
 
         let mut responses_iter = responses.into_iter();
-        for (hash, signed_action) in actions_with_hashes.into_iter() {
+        for (_bundle_hash, signed_action) in actions_with_hashes.into_iter() {
             let response = responses_iter.next().unwrap_or_else(|| ActionResponse {
                 user: String::new(),
                 res: ResponseResult::default(),
             });
-            // Hash is extracted from signed_action_bundles[i].0
-            // This is the consensus-generated transaction hash that includes block number
+            // Note: signed_action_bundles[i].0 contains a bundle hash, but it's non-unique
+            // (multiple transactions in the same bundle share the same hash).
+            // We leave hash empty since unique transaction hashes are not available from this source.
             let ActionResponse { user, res } = response;
             let tx = TransactionRecord {
                 time: timestamp,
                 user,
-                hash,
+                hash: String::new(), // Hash not available for transactions
                 action: signed_action.action,
                 block: block_height,
                 error: parse_error(&res),
@@ -277,4 +308,57 @@ where
     D: Deserializer<'de>,
 {
     Option::<String>::deserialize(deserializer).map(|value| value.unwrap_or_default())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parse_error_from_err_status() {
+        let res = ResponseResult {
+            status: "err".to_string(),
+            response: serde_json::json!("Invalid nonce: duplicate nonce 1764221206959"),
+        };
+        assert_eq!(
+            parse_error(&res),
+            Some("Invalid nonce: duplicate nonce 1764221206959".to_string())
+        );
+    }
+
+    #[test]
+    fn parse_error_from_ok_status_with_nested_error() {
+        let res = ResponseResult {
+            status: "ok".to_string(),
+            response: serde_json::json!({
+                "type": "order",
+                "data": {
+                    "statuses": [
+                        {"error": "Order could not immediately match against any resting orders. asset=123"}
+                    ]
+                }
+            }),
+        };
+        assert_eq!(
+            parse_error(&res),
+            Some(
+                "Order could not immediately match against any resting orders. asset=123"
+                    .to_string()
+            )
+        );
+    }
+
+    #[test]
+    fn parse_error_from_ok_status_success() {
+        let res = ResponseResult {
+            status: "ok".to_string(),
+            response: serde_json::json!({
+                "type": "order",
+                "data": {
+                    "statuses": [{"resting": {"oid": 123456}}]
+                }
+            }),
+        };
+        assert_eq!(parse_error(&res), None);
+    }
 }

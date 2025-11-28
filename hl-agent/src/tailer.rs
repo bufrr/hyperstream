@@ -156,6 +156,18 @@ pub async fn tail_file(
 
                     if parse_failed {
                         read_offset = next_read_offset;
+                        // Persist checkpoint even when parsing fails to avoid re-reading corrupt data
+                        if let Ok(meta) = fs::metadata(&file_path).await {
+                            let file_size = meta.len();
+                            let last_modified_ts = meta
+                                .modified()
+                                .ok()
+                                .and_then(system_time_seconds)
+                                .unwrap_or_default();
+                            let _ = checkpoint_db
+                                .set_offset(&file_path, read_offset, file_size, last_modified_ts)
+                                .await;
+                        }
                         sleep(sleep_interval).await;
                         continue;
                     }
@@ -410,25 +422,31 @@ async fn tail_blocks_file_bulk(
             continue;
         }
 
-        // File is stable - bulk load entire file
-        // Bulk loads hold the entire file in memory, so refuse to process oversized inputs.
-        if current_size >= bulk_load_abort_bytes {
+        // File is stable - bulk load unprocessed portion of the file
+        let remaining_bytes = current_size.saturating_sub(checkpoint_offset);
+
+        // Bulk loads hold the remaining portion in memory, so refuse to process oversized inputs.
+        if remaining_bytes >= bulk_load_abort_bytes {
             error!(
                 path = %file_path.display(),
                 file_size = current_size,
+                remaining_bytes,
                 abort_threshold = bulk_load_abort_bytes,
                 "bulk load aborted; refusing to read multi-GB file into memory"
             );
-            stable_count = 0;
-            last_seen_size = Some(current_size);
-            sleep(sleep_interval).await;
-            continue;
+            return Err(anyhow::anyhow!(
+                "bulk load aborted for {}; remaining bytes {} exceed threshold {}",
+                file_path.display(),
+                remaining_bytes,
+                bulk_load_abort_bytes
+            ));
         }
 
-        if current_size >= bulk_load_warn_bytes {
+        if remaining_bytes >= bulk_load_warn_bytes {
             warn!(
                 path = %file_path.display(),
                 file_size = current_size,
+                remaining_bytes,
                 warn_threshold = bulk_load_warn_bytes,
                 "bulk loading large file; entire buffer will be held in memory"
             );
@@ -440,7 +458,19 @@ async fn tail_blocks_file_bulk(
             "file size stabilized; starting bulk load"
         );
 
-        match read_entire_file(&file_path).await {
+        if remaining_bytes == 0 {
+            debug!(
+                path = %file_path.display(),
+                checkpoint_offset,
+                "no new data beyond checkpoint after stabilization"
+            );
+            stable_count = 0;
+            last_seen_size = Some(current_size);
+            sleep(sleep_interval).await;
+            continue;
+        }
+
+        match read_new_bytes(&file_path, checkpoint_offset, remaining_bytes as usize).await {
             Ok(buffer) => {
                 if buffer.is_empty() {
                     warn!(path = %file_path.display(), "bulk load returned empty buffer");
@@ -504,6 +534,8 @@ async fn tail_blocks_file_bulk(
                     "parsing complete"
                 );
 
+                let next_offset = checkpoint_offset.saturating_add(buffer.len() as u64);
+
                 // Send records in batches
                 if !records.is_empty() {
                     let total_records = records.len();
@@ -558,7 +590,7 @@ async fn tail_blocks_file_bulk(
                         // Bulk loads process the entire file at once; report the full byte offset so
                         // downstream diagnostics know we've consumed the whole file.
                         record_sink
-                            .send_batch(file_path_str.clone(), current_size, chunk)
+                            .send_batch(file_path_str.clone(), next_offset, chunk)
                             .await?;
                     }
 
@@ -577,12 +609,17 @@ async fn tail_blocks_file_bulk(
 
                 // Mark file as fully processed
                 checkpoint_db
-                    .set_offset(&file_path, current_size, current_size, last_modified_ts)
+                    .set_offset(
+                        &file_path,
+                        next_offset.min(current_size),
+                        current_size,
+                        last_modified_ts,
+                    )
                     .await?;
 
                 info!(
                     path = %file_path.display(),
-                    checkpoint_offset = current_size,
+                    checkpoint_offset = next_offset,
                     "file fully processed; monitoring for new files"
                 );
 
@@ -603,29 +640,4 @@ async fn tail_blocks_file_bulk(
 
         sleep(sleep_interval).await;
     }
-}
-
-/// Read a file into memory in one pass for the periodic blocks bulk loader.
-///
-/// This keeps the implementation simple and leverages the configurable bulk load thresholds
-/// (default: warn at 500 MiB, abort at 1 GiB) to ensure we never allocate excessive memory.
-/// If blocks files exceed the abort threshold, we should replace this with a streaming
-/// MessagePack reader that can yield frames incrementally without holding the entire file.
-async fn read_entire_file(path: &PathBuf) -> Result<Vec<u8>> {
-    let metadata = fs::metadata(path)
-        .await
-        .with_context(|| format!("failed to get metadata for {}", path.display()))?;
-
-    let file_size = metadata.len() as usize;
-
-    let mut file = fs::File::open(path)
-        .await
-        .with_context(|| format!("failed to open {}", path.display()))?;
-
-    let mut buffer = Vec::with_capacity(file_size);
-    file.read_to_end(&mut buffer)
-        .await
-        .with_context(|| format!("failed to read entire file {}", path.display()))?;
-
-    Ok(buffer)
 }
