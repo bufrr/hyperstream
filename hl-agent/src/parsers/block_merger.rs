@@ -74,7 +74,7 @@ impl BlockMerger {
     }
 
     /// Create a BlockMerger using the provided HashStore (primarily for tests).
-    #[allow(dead_code)]
+    #[cfg(test)]
     pub fn with_store(hash_store: Arc<HashStore>) -> Self {
         Self {
             hash_store,
@@ -90,10 +90,11 @@ impl BlockMerger {
     }
 
     /// Process a block from the file parser asynchronously, fetching the hash if available.
-    pub async fn process_file_block(&self, data: ReplicaBlockData) -> MergedBlock {
+    /// Returns None if Redis data exists but validation fails (block_time or proposer mismatch).
+    pub async fn process_file_block(&self, data: ReplicaBlockData) -> Option<MergedBlock> {
         self.stats.blocks_processed.fetch_add(1, Ordering::Relaxed);
 
-        let hash = match self.hash_store.get_block_data(data.height).await {
+        match self.hash_store.get_block_data(data.height).await {
             Some(redis_data) => {
                 let block_time_match = redis_data.block_time == data.block_time;
                 let proposer_match =
@@ -101,7 +102,7 @@ impl BlockMerger {
 
                 if block_time_match && proposer_match {
                     self.stats.hash_hits.fetch_add(1, Ordering::Relaxed);
-                    Some(redis_data.hash)
+                    Some(MergedBlock::from_replica_data(data, Some(redis_data.hash)))
                 } else {
                     self.stats.hash_misses.fetch_add(1, Ordering::Relaxed);
                     self.stats
@@ -113,22 +114,22 @@ impl BlockMerger {
                         actual_block_time = redis_data.block_time,
                         expected_proposer = %data.proposer,
                         actual_proposer = %redis_data.proposer,
-                        "Redis block data validation failed; ignoring hash"
+                        "Redis block data validation failed; dropping block"
                     );
-                    None
+                    None // Don't push block if validation fails
                 }
             }
             None => {
+                // No Redis data - emit block without hash
                 self.stats.hash_misses.fetch_add(1, Ordering::Relaxed);
-                None
+                Some(MergedBlock::from_replica_data(data, None))
             }
-        };
-
-        MergedBlock::from_replica_data(data, hash)
+        }
     }
 
     /// Blocking helper for synchronous callers (e.g., parsers running inside Tokio tasks).
-    pub fn process_file_block_blocking(&self, data: ReplicaBlockData) -> MergedBlock {
+    /// Returns None if Redis data exists but validation fails.
+    pub fn process_file_block_blocking(&self, data: ReplicaBlockData) -> Option<MergedBlock> {
         if let Ok(handle) = Handle::try_current() {
             task::block_in_place(|| handle.block_on(self.process_file_block(data)))
         } else {
@@ -208,7 +209,7 @@ mod tests {
         store.cache_insert_for_test(100, redis_data(block.block_time, "PROPOSER", "0xabc123"));
         let merger = BlockMerger::with_store(store);
 
-        let merged = merger.process_file_block(block).await;
+        let merged = merger.process_file_block(block).await.expect("block should be emitted");
         assert_eq!(merged.hash, "0xabc123");
     }
 
@@ -217,7 +218,8 @@ mod tests {
         let store = test_store().await;
         let merger = BlockMerger::with_store(store);
 
-        let merged = merger.process_file_block(sample_block(200)).await;
+        // No Redis data - block should still be emitted without hash
+        let merged = merger.process_file_block(sample_block(200)).await.expect("block should be emitted");
         assert_eq!(merged.hash, "");
     }
 
@@ -231,19 +233,20 @@ mod tests {
         );
         let merger = BlockMerger::with_store(store);
 
-        let merged = merger.process_file_block_blocking(block);
+        let merged = merger.process_file_block_blocking(block).expect("block should be emitted");
         assert_eq!(merged.hash, "0xdeadbeef");
     }
 
     #[tokio::test]
-    async fn test_validation_failure() {
+    async fn test_validation_failure_drops_block() {
         let store = test_store().await;
         // Intentionally set a mismatched block time.
         store.cache_insert_for_test(400, redis_data(1_800_000_000_000, "proposer", "0xfeedface"));
         let merger = BlockMerger::with_store(store);
 
+        // Block should NOT be emitted due to validation failure
         let merged = merger.process_file_block(sample_block(400)).await;
-        assert_eq!(merged.hash, "");
+        assert!(merged.is_none(), "block should be dropped on validation failure");
         assert_eq!(merger.stats.validation_failures.load(Ordering::Relaxed), 1);
     }
 }

@@ -1,24 +1,10 @@
-//! Shared utility functions for parsers
-//!
-//! This module contains helper functions used across multiple parsers:
-//! - Line extraction and processing
-//! - Timestamp parsing (ISO8601)
-//! - Transaction hash normalization
-//! - Flexible deserialization helpers
-//! - File path utilities
-//! - System timestamp utilities
-
 use serde::de::DeserializeOwned;
 use serde::Deserialize;
 use std::path::Path;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-/// Default limit for line preview in error messages (256 characters)
 pub const LINE_PREVIEW_LIMIT: usize = 256;
 
-/// Extracts starting block number from file path (e.g., "808750000" from path).
-///
-/// Returns None if the filename cannot be parsed as a u64.
 pub(crate) fn extract_starting_block(file_path: &Path) -> Option<u64> {
     file_path
         .file_name()
@@ -26,10 +12,6 @@ pub(crate) fn extract_starting_block(file_path: &Path) -> Option<u64> {
         .and_then(|name| name.parse::<u64>().ok())
 }
 
-/// Flexible deserializer for Option<String> that handles various input types.
-///
-/// Returns None for null/empty values, Some(String) otherwise.
-/// Handles strings, numbers, and booleans.
 pub(crate) fn deserialize_option_string<'de, D>(deserializer: D) -> Result<Option<String>, D::Error>
 where
     D: serde::Deserializer<'de>,
@@ -54,10 +36,6 @@ where
     }
 }
 
-/// Extracts complete lines (ending with `\n`) from a buffer.
-///
-/// Lines are removed from the buffer and returned as a Vec. Incomplete data
-/// (after the last `\n`) remains in the buffer for the next call.
 pub(crate) fn drain_complete_lines(buffer: &mut Vec<u8>) -> Vec<Vec<u8>> {
     let mut lines = Vec::new();
     let mut start = 0usize;
@@ -77,7 +55,6 @@ pub(crate) fn drain_complete_lines(buffer: &mut Vec<u8>) -> Vec<Vec<u8>> {
     lines
 }
 
-/// Trims trailing whitespace and carriage returns from a line.
 pub(crate) fn trim_line_bytes(mut line: Vec<u8>) -> Vec<u8> {
     while line.last().map(|b| *b == b'\r' || *b == b' ') == Some(true) {
         line.pop();
@@ -85,9 +62,6 @@ pub(crate) fn trim_line_bytes(mut line: Vec<u8>) -> Vec<u8> {
     line
 }
 
-/// Creates a preview string from a byte slice, truncating at the specified limit with ellipsis.
-///
-/// Used for logging parsed line content without overwhelming the logs.
 pub(crate) fn line_preview(line: &[u8], limit: usize) -> String {
     let text = String::from_utf8_lossy(line);
     let mut preview = String::new();
@@ -101,9 +75,6 @@ pub(crate) fn line_preview(line: &[u8], limit: usize) -> String {
     preview
 }
 
-/// Flexible deserializer that accepts both strings and numbers.
-///
-/// Converts numbers to strings. Useful for handling Hyperliquid's inconsistent field types.
 pub(crate) fn deserialize_string_or_number<'de, D>(deserializer: D) -> Result<String, D::Error>
 where
     D: serde::Deserializer<'de>,
@@ -121,9 +92,6 @@ where
     }
 }
 
-/// Flexible deserializer for u64 that accepts strings, numbers, or booleans.
-///
-/// Returns 0 for null values. Booleans are converted to 1/0.
 pub(crate) fn deserialize_u64_from_any<'de, D>(deserializer: D) -> Result<u64, D::Error>
 where
     D: serde::Deserializer<'de>,
@@ -146,9 +114,6 @@ where
     }
 }
 
-/// Flexible deserializer for Option<u64> that accepts strings, numbers, or booleans.
-///
-/// Returns None for null values or empty strings.
 pub(crate) fn deserialize_option_u64_from_any<'de, D>(
     deserializer: D,
 ) -> Result<Option<u64>, D::Error>
@@ -180,14 +145,6 @@ where
     }
 }
 
-/// Parses an ISO8601 timestamp string to milliseconds since Unix epoch.
-///
-/// Supports:
-/// - Zulu time (Z suffix)
-/// - Timezone offsets (+HH:MM, -HH:MM, +HHMM, -HHMM)
-/// - Fractional seconds (arbitrary precision, converted to milliseconds)
-///
-/// Returns None for invalid timestamps or dates before Unix epoch.
 pub(crate) fn parse_iso8601_to_millis(input: &str) -> Option<u64> {
     let trimmed = input.trim();
     if trimmed.is_empty() {
@@ -251,13 +208,6 @@ pub(crate) fn parse_iso8601_to_millis(input: &str) -> Option<u64> {
     }
 }
 
-/// Normalizes a transaction hash, filtering out empty or all-zero hashes.
-///
-/// Returns None for:
-/// - Empty strings
-/// - All-zero hashes (0x000...000)
-///
-/// Preserves the `0x` prefix if present.
 pub(crate) fn normalize_tx_hash(hash: &str) -> Option<String> {
     let trimmed = hash.trim();
     if trimmed.is_empty() {
@@ -276,9 +226,6 @@ pub(crate) fn normalize_tx_hash(hash: &str) -> Option<String> {
     Some(trimmed.to_string())
 }
 
-/// Returns the current Unix timestamp in seconds.
-///
-/// Used for checkpoint tracking and hash store caching.
 pub fn current_timestamp() -> i64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -352,14 +299,6 @@ fn days_from_civil(year: i32, month: u32, day: u32) -> Option<i64> {
     Some(era as i64 * 146_097 + day_of_era - 719468)
 }
 
-/// Generic deserializer for event lists that may be null, an array, or an object-map.
-///
-/// Handles flexible input formats commonly seen in Hyperliquid node data:
-/// - `null` → empty Vec
-/// - `[...]` → Vec from array items
-/// - `{key1: ..., key2: ...}` → Vec from object values (keys ignored)
-///
-/// The `context` parameter is used for error messages to identify the event type.
 pub(crate) fn deserialize_flexible_events<'de, D, T>(
     deserializer: D,
     context: &'static str,

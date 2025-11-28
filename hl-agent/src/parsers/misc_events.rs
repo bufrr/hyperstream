@@ -1,7 +1,6 @@
-use crate::parsers::batch::BatchEnvelope;
 use crate::parsers::{
-    line_preview, normalize_tx_hash, parse_iso8601_to_millis, BufferedLineParser, LineParser,
-    LINE_PREVIEW_LIMIT,
+    line_preview, normalize_tx_hash, parse_iso8601_to_millis, schemas::BatchEnvelope,
+    BufferedLineParser, LineParser, LINE_PREVIEW_LIMIT,
 };
 use crate::sorter_client::proto::DataRecord;
 use anyhow::{Context, Result};
@@ -73,7 +72,6 @@ fn node_misc_event_to_record(event: RawMiscEvent, block_height: Option<u64>) -> 
         hash,
         mut payload,
     } = event;
-    let user = extract_user_from_payload(&payload);
     let inner_value = payload
         .remove("inner")
         .unwrap_or_else(|| Value::Object(payload.clone()));
@@ -83,8 +81,6 @@ fn node_misc_event_to_record(event: RawMiscEvent, block_height: Option<u64>) -> 
         hash,
         inner: inner_value,
     };
-
-    let _ = user; // User extracted but no longer needed for partition_key
 
     let payload =
         serde_json::to_vec(&event).context("failed to encode misc event payload to JSON")?;
@@ -100,57 +96,4 @@ fn node_misc_event_to_record(event: RawMiscEvent, block_height: Option<u64>) -> 
         topic: "hl.misc_events".to_string(),
         payload,
     })
-}
-
-fn extract_user_from_payload(payload: &Map<String, Value>) -> String {
-    if let Some(user_value) = payload.get("user").and_then(Value::as_str) {
-        return user_value.to_string();
-    }
-
-    if let Some(Value::Object(inner_map)) = payload.get("inner") {
-        for event_data in inner_map.values() {
-            let user = extract_user_from_event(event_data);
-            if !user.is_empty() {
-                return user;
-            }
-        }
-    }
-
-    for value in payload.values() {
-        let user = extract_user_from_event(value);
-        if !user.is_empty() {
-            return user;
-        }
-    }
-
-    String::new()
-}
-
-fn extract_user_from_event(event_data: &Value) -> String {
-    if let Value::Object(map) = event_data {
-        map.get("user")
-            .and_then(Value::as_str)
-            .map(ToString::to_string)
-            .or_else(|| {
-                map.get("users").and_then(|value| {
-                    value
-                        .as_array()
-                        .and_then(|arr| arr.first())
-                        .and_then(Value::as_str)
-                        .map(ToString::to_string)
-                })
-            })
-            .or_else(|| {
-                map.get("delta").and_then(|value| {
-                    value
-                        .as_object()
-                        .and_then(|delta| delta.get("user"))
-                        .and_then(Value::as_str)
-                        .map(ToString::to_string)
-                })
-            })
-            .unwrap_or_default()
-    } else {
-        String::new()
-    }
 }

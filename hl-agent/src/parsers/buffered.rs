@@ -45,15 +45,8 @@ impl<P: LineParser> BufferedLineParser<P> {
     }
 
     /// Get a reference to the inner line parser.
-    #[allow(dead_code)]
     pub fn inner(&self) -> &P {
         &self.inner
-    }
-
-    /// Get a mutable reference to the inner line parser.
-    #[allow(dead_code)]
-    pub fn inner_mut(&mut self) -> &mut P {
-        &mut self.inner
     }
 }
 

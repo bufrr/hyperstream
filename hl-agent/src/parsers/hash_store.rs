@@ -114,12 +114,6 @@ impl HashStore {
         }
     }
 
-    /// Retrieve only the hash for backwards compatibility with prior callers.
-    #[allow(dead_code)]
-    pub async fn get(&self, height: u64) -> Option<String> {
-        self.get_block_data(height).await.map(|data| data.hash)
-    }
-
     pub fn global() -> Arc<HashStore> {
         GLOBAL_HASH_STORE
             .get()

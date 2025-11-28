@@ -1,8 +1,7 @@
-use crate::parsers::batch::BatchEnvelope;
 use crate::parsers::utils::deserialize_option_string;
 use crate::parsers::{
-    drain_complete_lines, line_preview, normalize_tx_hash, parse_iso8601_to_millis,
-    trim_line_bytes, Parser, LINE_PREVIEW_LIMIT,
+    line_preview, normalize_tx_hash, parse_iso8601_to_millis, schemas::BatchEnvelope,
+    BufferedLineParser, LineParser, LINE_PREVIEW_LIMIT,
 };
 use crate::sorter_client::proto::DataRecord;
 use anyhow::{Context, Result};
@@ -15,10 +14,11 @@ use tracing::warn;
 ///
 /// The parser handles both single-event lines and batch envelopes, normalizes hashes, and flattens
 /// the order fields that downstream consumers expect.
+pub type OrdersParser = BufferedLineParser<OrdersLineParser>;
+
+/// Line-level parser for order statuses.
 #[derive(Default)]
-pub struct OrdersParser {
-    buffer: Vec<u8>,
-}
+pub struct OrdersLineParser;
 
 #[derive(Serialize, Default)]
 #[serde(rename_all = "camelCase")]
@@ -66,50 +66,42 @@ struct NodeOrderStatus {
     status: Value,
 }
 
-impl Parser for OrdersParser {
-    fn parse(&mut self, _file_path: &Path, data: &[u8]) -> Result<Vec<DataRecord>> {
-        self.buffer.extend_from_slice(data);
-        let lines = drain_complete_lines(&mut self.buffer);
-        let mut records = Vec::with_capacity(lines.len());
+impl LineParser for OrdersLineParser {
+    fn parse_line(&mut self, _file_path: &Path, line: &[u8]) -> Result<Vec<DataRecord>> {
+        let mut records = Vec::new();
 
-        for (line_idx, raw_line) in lines.into_iter().enumerate() {
-            let line = trim_line_bytes(raw_line);
-            if line.is_empty() {
-                continue;
+        if let Ok(batch) = serde_json::from_slice::<BatchEnvelope<NodeOrderStatus>>(line) {
+            let block_number = batch.block_number;
+            for event in batch.events {
+                records.push(order_status_to_record(
+                    event,
+                    Some(block_number),
+                    batch.block_time.as_deref(),
+                )?);
             }
+            return Ok(records);
+        }
 
-            if let Ok(batch) = serde_json::from_slice::<BatchEnvelope<NodeOrderStatus>>(&line) {
-                let block_number = batch.block_number;
-                for event in batch.events {
-                    records.push(order_status_to_record(
-                        event,
-                        Some(block_number),
-                        batch.block_time.as_deref(),
-                    )?);
-                }
-                continue;
+        match serde_json::from_slice::<NodeOrderStatus>(line) {
+            Ok(event) => {
+                records.push(order_status_to_record(event, None, None)?);
             }
-
-            match serde_json::from_slice::<NodeOrderStatus>(&line) {
-                Ok(event) => {
-                    records.push(order_status_to_record(event, None, None)?);
-                }
-                Err(err) => {
-                    warn!(
-                        error = %err,
-                        line_idx,
-                        preview = %line_preview(&line, LINE_PREVIEW_LIMIT),
-                        "skipping unrecognized order status line format"
-                    );
-                }
+            Err(err) => {
+                warn!(
+                    error = %err,
+                    preview = %line_preview(line, LINE_PREVIEW_LIMIT),
+                    "skipping unrecognized order status line format"
+                );
             }
         }
 
         Ok(records)
     }
+}
 
-    fn backlog_len(&self) -> usize {
-        self.buffer.len()
+impl Default for BufferedLineParser<OrdersLineParser> {
+    fn default() -> Self {
+        BufferedLineParser::new(OrdersLineParser)
     }
 }
 

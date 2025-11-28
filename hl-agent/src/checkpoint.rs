@@ -10,7 +10,6 @@ pub struct CheckpointDB {
     path: Arc<PathBuf>,
 }
 
-#[allow(dead_code)]
 #[derive(Debug, Clone)]
 pub struct CheckpointRecord {
     pub file_path: PathBuf,
@@ -79,15 +78,6 @@ impl CheckpointDB {
             .get(file_path)
             .await?
             .map(|rec| rec.byte_offset)
-            .unwrap_or(0))
-    }
-
-    #[allow(dead_code)]
-    pub async fn get_line_count(&self, file_path: &Path) -> Result<u64> {
-        Ok(self
-            .get(file_path)
-            .await?
-            .map(|rec| rec.line_count)
             .unwrap_or(0))
     }
 

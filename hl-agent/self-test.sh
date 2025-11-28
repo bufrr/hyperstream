@@ -37,7 +37,7 @@ REPORT_FILE="${TEST_DIR}/test-report.md"
 AGENT_RUST_LOG="${HL_AGENT_RUST_LOG:-${RUST_LOG:-info}}"
 
 # Test parameters (defaults)
-TEST_DURATION=180  # 3 minutes - ensures all 6 topics are verified (blocks/transactions need time)
+TEST_DURATION=30  # 30 seconds default
 KEEP_OUTPUT=false
 DATA_DIR="${HOME}/hl-data"
 
@@ -45,11 +45,11 @@ DATA_DIR="${HOME}/hl-data"
 while [[ $# -gt 0 ]]; do
     case $1 in
         --quick)
-            TEST_DURATION=180  # 3 minutes - enough for all 6 topics including blocks/transactions
+            TEST_DURATION=30  # 30 seconds quick test
             shift
             ;;
         --full)
-            TEST_DURATION=300  # 5 minutes - comprehensive verification
+            TEST_DURATION=180  # 3 minutes - comprehensive verification
             shift
             ;;
         --keep-output)
@@ -312,7 +312,7 @@ start_mock_sorter() {
     log_step "Starting Mock Sorter"
 
     log_info "Launching mock gRPC server..."
-    ./target/release/examples/mock_sorter \
+    RUST_LOG=info ./target/release/examples/mock_sorter \
         --listen-addr 127.0.0.1:50051 \
         --stats-interval-ms 5000 \
         --output-dir "${OUTPUT_DIR}" \
@@ -394,8 +394,78 @@ monitor_progress() {
     log_success "Test duration completed"
 }
 
+print_mock_server_stats() {
+    log_step "Mock Server Statistics"
+
+    if [ ! -f "${MOCK_LOG}" ]; then
+        log_warning "Mock server log not found"
+        return
+    fi
+
+    # Strip ANSI codes and get the last stats line from mock sorter
+    local last_stats=$(sed 's/\x1b\[[0-9;]*m//g' "${MOCK_LOG}" | grep "sorter stats" | tail -1)
+
+    if [ -z "$last_stats" ]; then
+        log_warning "No stats found in mock server log"
+        return
+    fi
+
+    # Parse and display key metrics from the stats line
+    echo ""
+    log_info "Final mock sorter statistics:"
+    echo ""
+
+    # Extract metrics using grep/sed (after stripping ANSI codes)
+    local total_batches=$(echo "$last_stats" | grep -oP 'total_batches=\K[0-9]+' || echo "N/A")
+    local total_records=$(echo "$last_stats" | grep -oP 'total_records=\K[0-9]+' || echo "N/A")
+    local total_bytes=$(echo "$last_stats" | grep -oP 'total_bytes=\K[0-9]+' || echo "N/A")
+    local records_per_sec=$(echo "$last_stats" | grep -oP 'records_per_sec=\K[0-9.]+' || echo "N/A")
+    local mb_per_sec=$(echo "$last_stats" | grep -oP 'mb_per_sec=\K[0-9.]+' || echo "N/A")
+    local unique_tx=$(echo "$last_stats" | grep -oP 'unique_tx=\K[0-9]+' || echo "N/A")
+    local unique_block_heights=$(echo "$last_stats" | grep -oP 'unique_block_heights=\K[0-9]+' || echo "N/A")
+    local invalid_records=$(echo "$last_stats" | grep -oP 'invalid_records=\K[0-9]+' || echo "N/A")
+    local topics_coverage=$(echo "$last_stats" | grep -oP 'topics_coverage="?\K[^" ]+' || echo "N/A")
+    local topic_totals=$(echo "$last_stats" | grep -oP 'topic_totals=\K[^ ]+.*topic_rates' | sed 's/ *topic_rates$//' || echo "N/A")
+
+    # Format bytes to MB
+    if [ "$total_bytes" != "N/A" ] && [ "$total_bytes" -gt 0 ] 2>/dev/null; then
+        local total_mb=$(echo "scale=2; $total_bytes / 1048576" | bc)
+        total_bytes="${total_mb} MB"
+    fi
+
+    echo -e "  ${GREEN}Throughput:${NC}"
+    echo "    Total Batches:     ${total_batches}"
+    echo "    Total Records:     ${total_records}"
+    echo "    Total Data:        ${total_bytes}"
+    echo "    Records/sec:       ${records_per_sec}"
+    echo "    MB/sec:            ${mb_per_sec}"
+    echo ""
+    echo -e "  ${GREEN}Data Quality:${NC}"
+    echo "    Unique Tx Hashes:  ${unique_tx}"
+    echo "    Unique Blocks:     ${unique_block_heights}"
+    echo "    Invalid Records:   ${invalid_records}"
+    echo ""
+    echo -e "  ${GREEN}Topic Coverage:${NC} ${topics_coverage}"
+    echo "    ${topic_totals}"
+    echo ""
+
+    # Show last few stats lines for trend
+    log_info "Recent stats history (last 5 intervals):"
+    sed 's/\x1b\[[0-9;]*m//g' "${MOCK_LOG}" | grep "sorter stats" | tail -5 | while read line; do
+        local ts=$(echo "$line" | grep -oP '^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}' || echo "")
+        local coverage=$(echo "$line" | grep -oP 'topics_coverage="?\K[^" ]+' || echo "?/?")
+        local rps=$(echo "$line" | grep -oP 'records_per_sec=\K[0-9.]+' || echo "0")
+        local batches=$(echo "$line" | grep -oP 'total_batches=\K[0-9]+' || echo "0")
+        echo "    [${ts}] coverage=${coverage} records/s=${rps} batches=${batches}"
+    done
+    echo ""
+}
+
 analyze_results() {
     log_step "Analyzing Results"
+
+    # Print mock server stats first
+    print_mock_server_stats
 
     # Count total batches
     local total_batches=$(find "${OUTPUT_DIR}" -name "batch-*.json" 2>/dev/null | wc -l)

@@ -3,7 +3,6 @@ use crate::output_writer::RecordSink;
 use crate::parsers;
 use crate::sorter_client::proto::DataRecord;
 use anyhow::{Context, Result};
-use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -17,7 +16,6 @@ const DEFAULT_POLL_INTERVAL_MS: u64 = 100;
 const MAX_READ_CHUNK_BYTES: usize = 8 * 1024 * 1024; // 8 MiB per iteration
 const FILE_SIZE_STABLE_POLLS: u32 = 2; // Number of polls with unchanged size to consider file stable
 
-/// Configuration for file tailers.
 #[derive(Clone)]
 pub struct TailerConfig {
     pub checkpoint_db: Arc<CheckpointDB>,
@@ -54,6 +52,9 @@ pub async fn tail_file(
 
     let mut active_parsers = active_parsers;
     let checkpoint = checkpoint_db.get(&file_path).await?;
+    if let Some(rec) = &checkpoint {
+        debug!(path = %rec.file_path.display(), file_size = rec.file_size, last_modified_ts = rec.last_modified_ts, updated_at = rec.updated_at, "resuming from checkpoint");
+    }
     let mut read_offset = checkpoint.as_ref().map(|rec| rec.byte_offset).unwrap_or(0);
     let initial_line_count = checkpoint.as_ref().map(|rec| rec.line_count).unwrap_or(0);
     for parser in active_parsers.iter_mut() {
@@ -65,7 +66,6 @@ pub async fn tail_file(
         poll_interval
     };
 
-    // Detect if this is a blocks file requiring bulk loading
     let is_blocks_file = file_path
         .iter()
         .any(|component| component.to_str() == Some("periodic_abci_states"));
@@ -97,11 +97,7 @@ pub async fn tail_file(
         let metadata = match fs::metadata(&file_path).await {
             Ok(meta) => meta,
             Err(err) => {
-                debug!(
-                    error = %err,
-                    path = %file_path.display(),
-                    "metadata unavailable; retrying"
-                );
+                debug!(error = %err, path = %file_path.display(), "metadata unavailable; retrying");
                 if sleep_or_cancel(sleep_interval, &cancel_token).await {
                     return Ok(());
                 }
@@ -117,12 +113,7 @@ pub async fn tail_file(
             .unwrap_or_default();
 
         if file_size < read_offset {
-            warn!(
-                path = %file_path.display(),
-                previous_offset = read_offset,
-                current_size = file_size,
-                "file truncated or rotated; resetting parser state"
-            );
+            warn!(path = %file_path.display(), previous_offset = read_offset, current_size = file_size, "file truncated or rotated; resetting parser state");
             read_offset = 0;
             active_parsers = parsers::route_parser(&file_path)?;
             for parser in active_parsers.iter_mut() {
@@ -166,35 +157,17 @@ pub async fn tail_file(
 
                     let mut records: Vec<DataRecord> = Vec::new();
                     let mut parse_failed = false;
-                    debug!(
-                        path = %file_path.display(),
-                        parser_count = active_parsers.len(),
-                        chunk_len = buffer.len(),
-                        "processing file chunk"
-                    );
+                    debug!(path = %file_path.display(), parser_count = active_parsers.len(), chunk_len = buffer.len(), "processing file chunk");
                     for (parser_index, parser) in active_parsers.iter_mut().enumerate() {
                         let parse_start = std::time::Instant::now();
                         match parser.parse(&file_path, &buffer) {
                             Ok(mut parsed_records) => {
                                 let parse_duration_ms = parse_start.elapsed().as_millis();
-                                debug!(
-                                    path = %file_path.display(),
-                                    parser_index,
-                                    returned_count = parsed_records.len(),
-                                    parse_duration_ms,
-                                    "parser produced records"
-                                );
+                                debug!(path = %file_path.display(), parser_index, returned_count = parsed_records.len(), parse_duration_ms, "parser produced records");
                                 records.append(&mut parsed_records);
                             }
                             Err(err) => {
-                                warn!(
-                                    error = %err,
-                                    path = %file_path.display(),
-                                    parser_index,
-                                    chunk_start,
-                                    bytes_read = buffer.len(),
-                                    "parse failed; continuing without retry (file data may be corrupted)"
-                                );
+                                warn!(error = %err, path = %file_path.display(), parser_index, chunk_start, bytes_read = buffer.len(), "parse failed; continuing without retry");
                                 parse_failed = true;
                                 break;
                             }
@@ -204,24 +177,15 @@ pub async fn tail_file(
                     if parse_failed {
                         read_offset = next_read_offset;
                         let line_count = max_line_count(&active_parsers);
-                        // Persist checkpoint even when parsing fails to avoid re-reading corrupt data
-                        if let Ok(meta) = fs::metadata(&file_path).await {
-                            let file_size = meta.len();
-                            let last_modified_ts = meta
-                                .modified()
-                                .ok()
-                                .and_then(system_time_seconds)
-                                .unwrap_or_default();
-                            let _ = checkpoint_db
-                                .set_offset(
-                                    &file_path,
-                                    read_offset,
-                                    file_size,
-                                    last_modified_ts,
-                                    line_count,
-                                )
-                                .await;
-                        }
+                        let _ = checkpoint_db
+                            .set_offset(
+                                &file_path,
+                                read_offset,
+                                file_size,
+                                last_modified_ts,
+                                line_count,
+                            )
+                            .await;
                         if sleep_or_cancel(sleep_interval, &cancel_token).await {
                             return Ok(());
                         }
@@ -253,55 +217,13 @@ pub async fn tail_file(
                     let had_records = !records.is_empty();
                     if had_records {
                         let total_records = records.len();
-                        let mut topic_counts: HashMap<String, usize> = HashMap::new();
-                        for record in &records {
-                            *topic_counts.entry(record.topic.clone()).or_default() += 1;
-                        }
-
-                        // Log all topics at INFO level for visibility
-                        for (topic, count) in &topic_counts {
-                            info!(
-                                path = %file_path.display(),
-                                %topic,
-                                record_count = count,
-                                "{} records emitted from parser chunk", topic
-                            );
-                        }
-
                         let planned_batches = if batch_size == 0 {
                             1
                         } else {
                             total_records.div_ceil(batch_size)
                         };
-
-                        for (topic, count) in topic_counts {
-                            debug!(
-                                path = %file_path.display(),
-                                %topic,
-                                record_count = count,
-                                total_records,
-                                batch_size,
-                                planned_batches,
-                                "parser produced records; handing off to sink"
-                            );
-                        }
-
-                        let batches: Vec<Vec<DataRecord>> = if batch_size == 0 {
-                            vec![records]
-                        } else {
-                            records
-                                .chunks(batch_size)
-                                .map(|chunk| chunk.to_vec())
-                                .collect()
-                        };
-
-                        debug!(
-                            path = %file_path.display(),
-                            batch_count = batches.len(),
-                            batch_size,
-                            total_records,
-                            "dispatching parsed batches"
-                        );
+                        let batches = chunk_records(records, batch_size);
+                        debug!(path = %file_path.display(), batch_count = batches.len(), batch_size, total_records, planned_batches, "dispatching parsed batches");
 
                         let file_path_str = file_path.to_string_lossy().to_string();
                         for (batch_idx, chunk) in batches.into_iter().enumerate() {
@@ -310,19 +232,10 @@ pub async fn tail_file(
                                 .send_batch(file_path_str.clone(), chunk_start, chunk)
                                 .await?;
 
-                            let send_complete = std::time::Instant::now();
-                            let total_latency_ms =
-                                send_complete.duration_since(loop_start).as_millis();
-
-                            info!(
-                                path = %file_path.display(),
-                                batch_idx,
-                                record_count,
-                                read_latency_ms,
-                                parse_latency_ms,
-                                total_latency_ms,
-                                "batch sent - latency breakdown"
-                            );
+                            let total_latency_ms = std::time::Instant::now()
+                                .duration_since(loop_start)
+                                .as_millis();
+                            info!(path = %file_path.display(), batch_idx, record_count, read_latency_ms, parse_latency_ms, total_latency_ms, "batch sent");
                         }
                     }
 
@@ -344,11 +257,7 @@ pub async fn tail_file(
                     }
                 }
                 Err(err) => {
-                    warn!(
-                        error = %err,
-                        path = %file_path.display(),
-                        "failed to read newly appended bytes"
-                    );
+                    warn!(error = %err, path = %file_path.display(), "failed to read newly appended bytes")
                 }
             }
         }
@@ -366,23 +275,11 @@ async fn read_new_bytes(path: &PathBuf, offset: u64, max_bytes: usize) -> Result
     file.seek(tokio::io::SeekFrom::Start(offset))
         .await
         .with_context(|| format!("failed to seek {} to offset {}", path.display(), offset))?;
-    if max_bytes == 0 {
-        return Ok(Vec::new());
-    }
-
-    let mut buffer = vec![0u8; max_bytes];
-    let mut total_read = 0usize;
-    while total_read < max_bytes {
-        let bytes_read = file
-            .read(&mut buffer[total_read..])
-            .await
-            .with_context(|| format!("failed to read from {}", path.display()))?;
-        if bytes_read == 0 {
-            break;
-        }
-        total_read += bytes_read;
-    }
-    buffer.truncate(total_read);
+    let mut buffer = Vec::with_capacity(max_bytes);
+    file.take(max_bytes as u64)
+        .read_to_end(&mut buffer)
+        .await
+        .with_context(|| format!("failed to read from {}", path.display()))?;
     Ok(buffer)
 }
 
@@ -400,15 +297,17 @@ fn max_line_count(parsers: &[Box<dyn parsers::Parser>]) -> u64 {
         .unwrap_or(0)
 }
 
-/// Specialized tailer for periodic_abci_states files that bulk loads complete MessagePack objects.
-///
-/// Strategy:
-/// 1. Monitor file size for stabilization (unchanged for FILE_SIZE_STABLE_POLLS cycles)
-/// 2. Once stable, bulk load entire file in one operation
-/// 3. Pass complete data to parser for MessagePack decoding
-/// 4. Mark file as fully processed in checkpoint
-///
-/// This eliminates the 60+ second chunked reading for 846MB files, reducing to ~2-3 seconds.
+fn chunk_records(records: Vec<DataRecord>, batch_size: usize) -> Vec<Vec<DataRecord>> {
+    if batch_size == 0 {
+        vec![records]
+    } else {
+        records
+            .chunks(batch_size)
+            .map(|chunk| chunk.to_vec())
+            .collect()
+    }
+}
+
 async fn tail_blocks_file_bulk(
     file_path: PathBuf,
     active_parsers: Vec<Box<dyn parsers::Parser>>,
@@ -433,11 +332,7 @@ async fn tail_blocks_file_bulk(
         parser.set_initial_line_count(initial_line_count);
     }
 
-    info!(
-        path = %file_path.display(),
-        initial_offset,
-        "starting bulk-load tailer for periodic_abci_states file"
-    );
+    info!(path = %file_path.display(), initial_offset, "starting bulk-load tailer for periodic_abci_states file");
 
     let mut last_seen_size: Option<u64> = None;
     let mut stable_count: u32 = 0;
@@ -449,11 +344,7 @@ async fn tail_blocks_file_bulk(
         let metadata = match fs::metadata(&file_path).await {
             Ok(meta) => meta,
             Err(err) => {
-                debug!(
-                    error = %err,
-                    path = %file_path.display(),
-                    "metadata unavailable; retrying"
-                );
+                debug!(error = %err, path = %file_path.display(), "metadata unavailable; retrying");
                 if sleep_or_cancel(sleep_interval, &cancel_token).await {
                     return Ok(());
                 }
@@ -468,14 +359,8 @@ async fn tail_blocks_file_bulk(
             .and_then(system_time_seconds)
             .unwrap_or_default();
 
-        // Check if we've already processed this file completely
         if checkpoint_offset >= current_size {
-            debug!(
-                path = %file_path.display(),
-                file_size = current_size,
-                checkpoint_offset = checkpoint_offset,
-                "file already fully processed; monitoring for changes"
-            );
+            debug!(path = %file_path.display(), file_size = current_size, checkpoint_offset = checkpoint_offset, "file already fully processed; monitoring for changes");
             if sleep_or_cancel(sleep_interval, &cancel_token).await {
                 return Ok(());
             }
@@ -483,27 +368,15 @@ async fn tail_blocks_file_bulk(
             continue;
         }
 
-        // Check if file size has stabilized
         match last_seen_size {
             Some(prev_size) if prev_size == current_size => {
                 stable_count += 1;
-                debug!(
-                    path = %file_path.display(),
-                    file_size = current_size,
-                    stable_count,
-                    required = FILE_SIZE_STABLE_POLLS,
-                    "file size unchanged"
-                );
+                debug!(path = %file_path.display(), file_size = current_size, stable_count, required = FILE_SIZE_STABLE_POLLS, "file size unchanged");
             }
             _ => {
-                // Size changed or first observation
                 stable_count = 1;
                 last_seen_size = Some(current_size);
-                debug!(
-                    path = %file_path.display(),
-                    file_size = current_size,
-                    "file size changed or first observation; resetting stability counter"
-                );
+                debug!(path = %file_path.display(), file_size = current_size, "file size changed or first observation; resetting stability counter");
             }
         }
 
@@ -515,18 +388,10 @@ async fn tail_blocks_file_bulk(
             continue;
         }
 
-        // File is stable - bulk load unprocessed portion of the file
         let remaining_bytes = current_size.saturating_sub(checkpoint_offset);
 
-        // Bulk loads hold the remaining portion in memory, so refuse to process oversized inputs.
         if remaining_bytes >= bulk_load_abort_bytes {
-            error!(
-                path = %file_path.display(),
-                file_size = current_size,
-                remaining_bytes,
-                abort_threshold = bulk_load_abort_bytes,
-                "bulk load aborted; refusing to read multi-GB file into memory"
-            );
+            error!(path = %file_path.display(), file_size = current_size, remaining_bytes, abort_threshold = bulk_load_abort_bytes, "bulk load aborted; refusing to read multi-GB file into memory");
             return Err(anyhow::anyhow!(
                 "bulk load aborted for {}; remaining bytes {} exceed threshold {}",
                 file_path.display(),
@@ -536,27 +401,13 @@ async fn tail_blocks_file_bulk(
         }
 
         if remaining_bytes >= bulk_load_warn_bytes {
-            warn!(
-                path = %file_path.display(),
-                file_size = current_size,
-                remaining_bytes,
-                warn_threshold = bulk_load_warn_bytes,
-                "bulk loading large file; entire buffer will be held in memory"
-            );
+            warn!(path = %file_path.display(), file_size = current_size, remaining_bytes, warn_threshold = bulk_load_warn_bytes, "bulk loading large file; entire buffer will be held in memory");
         }
 
-        info!(
-            path = %file_path.display(),
-            file_size = current_size,
-            "file size stabilized; starting bulk load"
-        );
+        info!(path = %file_path.display(), file_size = current_size, "file size stabilized; starting bulk load");
 
         if remaining_bytes == 0 {
-            debug!(
-                path = %file_path.display(),
-                checkpoint_offset,
-                "no new data beyond checkpoint after stabilization"
-            );
+            debug!(path = %file_path.display(), checkpoint_offset, "no new data beyond checkpoint after stabilization");
             stable_count = 0;
             last_seen_size = Some(current_size);
             if sleep_or_cancel(sleep_interval, &cancel_token).await {
@@ -626,12 +477,7 @@ async fn tail_blocks_file_bulk(
                 let parse_complete = std::time::Instant::now();
                 let parse_latency_ms = parse_complete.duration_since(read_complete).as_millis();
 
-                info!(
-                    path = %file_path.display(),
-                    record_count = records.len(),
-                    parse_latency_ms,
-                    "parsing complete"
-                );
+                info!(path = %file_path.display(), record_count = records.len(), parse_latency_ms, "parsing complete");
 
                 let next_offset = checkpoint_offset.saturating_add(buffer.len() as u64);
                 let line_count = max_line_count(&active_parsers);
@@ -639,51 +485,8 @@ async fn tail_blocks_file_bulk(
                 // Send records in batches
                 if !records.is_empty() {
                     let total_records = records.len();
-                    let mut topic_counts: HashMap<String, usize> = HashMap::new();
-                    let mut blocks_count = 0usize;
-                    let mut transactions_count = 0usize;
-                    for record in &records {
-                        match record.topic.as_str() {
-                            "hl.blocks" => blocks_count += 1,
-                            "hl.transactions" => transactions_count += 1,
-                            _ => {}
-                        }
-                        *topic_counts.entry(record.topic.clone()).or_default() += 1;
-                    }
-
-                    if blocks_count > 0 {
-                        info!(
-                            path = %file_path.display(),
-                            record_count = blocks_count,
-                            "hl.blocks records emitted from bulk parser"
-                        );
-                    }
-                    if transactions_count > 0 {
-                        info!(
-                            path = %file_path.display(),
-                            record_count = transactions_count,
-                            "hl.transactions records emitted from bulk parser"
-                        );
-                    }
-
-                    for (topic, count) in topic_counts {
-                        info!(
-                            path = %file_path.display(),
-                            %topic,
-                            record_count = count,
-                            total_records,
-                            "sending records to sink"
-                        );
-                    }
-
-                    let batches: Vec<Vec<DataRecord>> = if batch_size == 0 {
-                        vec![records]
-                    } else {
-                        records
-                            .chunks(batch_size)
-                            .map(|chunk| chunk.to_vec())
-                            .collect()
-                    };
+                    let batches = chunk_records(records, batch_size);
+                    info!(path = %file_path.display(), total_records, batch_count = batches.len(), "sending bulk records");
 
                     let file_path_str = file_path.to_string_lossy().to_string();
                     for chunk in batches {
@@ -694,17 +497,10 @@ async fn tail_blocks_file_bulk(
                             .await?;
                     }
 
-                    let send_complete = std::time::Instant::now();
-                    let total_latency_ms = send_complete.duration_since(loop_start).as_millis();
-
-                    info!(
-                        path = %file_path.display(),
-                        total_records,
-                        read_latency_ms,
-                        parse_latency_ms,
-                        total_latency_ms,
-                        "bulk load complete - all batches sent"
-                    );
+                    let total_latency_ms = std::time::Instant::now()
+                        .duration_since(loop_start)
+                        .as_millis();
+                    info!(path = %file_path.display(), total_records, read_latency_ms, parse_latency_ms, total_latency_ms, "bulk load complete - all batches sent");
                 }
 
                 // Mark file as fully processed
@@ -718,22 +514,14 @@ async fn tail_blocks_file_bulk(
                     )
                     .await?;
 
-                info!(
-                    path = %file_path.display(),
-                    checkpoint_offset = next_offset,
-                    "file fully processed; monitoring for new files"
-                );
+                info!(path = %file_path.display(), checkpoint_offset = next_offset, "file fully processed; monitoring for new files");
 
                 // Reset counters for potential file changes
                 stable_count = 0;
                 last_seen_size = Some(current_size);
             }
             Err(err) => {
-                warn!(
-                    error = %err,
-                    path = %file_path.display(),
-                    "failed to bulk load file; will retry"
-                );
+                warn!(error = %err, path = %file_path.display(), "failed to bulk load file; will retry");
                 stable_count = 0;
                 last_seen_size = None;
             }

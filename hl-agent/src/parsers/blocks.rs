@@ -119,18 +119,22 @@ impl crate::parsers::Parser for BlocksParser {
 
                         // Convert to ReplicaBlockData and process through merger
                         if let Some(replica_data) = self.abci_block_to_replica_data(block, height) {
-                            // Process block - looks up hash from cache and returns merged block
-                            let merged = self.merger.process_file_block_blocking(replica_data);
-                            match merged.to_data_record() {
-                                Ok(data_record) => records.push(data_record),
-                                Err(err) => {
-                                    warn!(
-                                        error = %err,
-                                        height,
-                                        "failed to convert merged block to data record"
-                                    );
+                            // Process block - looks up hash from cache, validates, and returns merged block
+                            // Returns None if Redis data exists but validation fails
+                            if let Some(merged) = self.merger.process_file_block_blocking(replica_data)
+                            {
+                                match merged.to_data_record() {
+                                    Ok(data_record) => records.push(data_record),
+                                    Err(err) => {
+                                        warn!(
+                                            error = %err,
+                                            height,
+                                            "failed to convert merged block to data record"
+                                        );
+                                    }
                                 }
                             }
+                            // If None, block was dropped due to validation failure (already warned in merger)
                         }
                     }
                 }

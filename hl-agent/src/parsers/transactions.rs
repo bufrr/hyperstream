@@ -1,12 +1,12 @@
 use crate::parsers::blocks::{proposer_cache, SharedProposerCache};
-use crate::parsers::utils::extract_starting_block;
+use crate::parsers::utils::{deserialize_option_string, extract_starting_block};
 use crate::parsers::{
     drain_complete_lines, line_preview, parse_iso8601_to_millis, trim_line_bytes, Parser,
     LINE_PREVIEW_LIMIT,
 };
 use crate::sorter_client::proto::DataRecord;
 use anyhow::{Context, Result};
-use serde::{de::Deserializer, Deserialize, Serialize};
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::path::Path;
 use tracing::warn;
@@ -47,11 +47,11 @@ struct ReplicaCmd {
 
 #[derive(Deserialize)]
 struct AbciBlock {
-    #[serde(default, deserialize_with = "string_or_default")]
-    time: String,
+    #[serde(default, deserialize_with = "deserialize_option_string")]
+    time: Option<String>,
     round: u64,
-    #[serde(default, deserialize_with = "string_or_default")]
-    proposer: String,
+    #[serde(default, deserialize_with = "deserialize_option_string")]
+    proposer: Option<String>,
     #[serde(default)]
     signed_action_bundles: Vec<BundleWithHash>,
 }
@@ -61,16 +61,16 @@ struct BundlePayload {
     #[serde(
         default,
         rename = "broadcaster",
-        deserialize_with = "string_or_default"
+        deserialize_with = "deserialize_option_string"
     )]
-    _broadcaster: String,
+    _broadcaster: Option<String>,
     #[serde(default)]
     signed_actions: Vec<SignedAction>,
 }
 
 #[derive(Deserialize)]
 struct BundleWithHash(
-    #[serde(deserialize_with = "string_or_default")] String,
+    #[serde(deserialize_with = "deserialize_option_string")] Option<String>,
     BundlePayload,
 );
 
@@ -90,22 +90,22 @@ struct Resps {
 
 #[derive(Deserialize)]
 struct ResponseBundle(
-    #[serde(deserialize_with = "string_or_default")] String,
+    #[serde(deserialize_with = "deserialize_option_string")] Option<String>,
     Vec<ActionResponse>,
 );
 
 #[derive(Deserialize)]
 struct ActionResponse {
-    #[serde(default, deserialize_with = "string_or_default")]
-    user: String,
+    #[serde(default, deserialize_with = "deserialize_option_string")]
+    user: Option<String>,
     #[serde(default)]
     res: ResponseResult,
 }
 
 #[derive(Deserialize, Default)]
 struct ResponseResult {
-    #[serde(default, deserialize_with = "string_or_default")]
-    status: String,
+    #[serde(default, deserialize_with = "deserialize_option_string")]
+    status: Option<String>,
     #[serde(default)]
     response: Value,
 }
@@ -201,11 +201,16 @@ impl TransactionsParser {
         // Use calculated height, fall back to round if filename parsing failed
         let block_height = calculated_height.unwrap_or(round);
 
-        if !(block_height == 0 || proposer.is_empty()) {
-            self.proposer_cache.insert(block_height, proposer);
+        if let Some(proposer) = proposer.filter(|p| !p.is_empty()) {
+            if block_height != 0 {
+                self.proposer_cache.insert(block_height, proposer);
+            }
         }
 
-        let timestamp = parse_iso8601_to_millis(&time).unwrap_or(0);
+        let timestamp = time
+            .as_deref()
+            .and_then(parse_iso8601_to_millis)
+            .unwrap_or(0);
         let actions_with_hashes = flatten_actions_with_hashes(signed_action_bundles);
         let responses = flatten_responses(resps);
 
@@ -223,7 +228,7 @@ impl TransactionsParser {
         let mut responses_iter = responses.into_iter();
         for (_bundle_hash, signed_action) in actions_with_hashes.into_iter() {
             let response = responses_iter.next().unwrap_or_else(|| ActionResponse {
-                user: String::new(),
+                user: None,
                 res: ResponseResult::default(),
             });
             // Note: signed_action_bundles[i].0 contains a bundle hash, but it's non-unique
@@ -232,7 +237,7 @@ impl TransactionsParser {
             let ActionResponse { user, res } = response;
             let tx = TransactionRecord {
                 time: timestamp,
-                user,
+                user: user.unwrap_or_default(),
                 hash: String::new(), // Hash not available for transactions
                 action: signed_action.action,
                 block: block_height,
@@ -248,8 +253,9 @@ impl TransactionsParser {
 fn flatten_actions_with_hashes(bundles: Vec<BundleWithHash>) -> Vec<(String, SignedAction)> {
     let mut actions_with_hashes = Vec::new();
     for BundleWithHash(hash, bundle) in bundles {
+        let hash_value = hash.unwrap_or_default();
         for action in bundle.signed_actions {
-            actions_with_hashes.push((hash.clone(), action));
+            actions_with_hashes.push((hash_value.clone(), action));
         }
     }
     actions_with_hashes
@@ -285,7 +291,7 @@ fn transaction_to_data_record(mut tx: TransactionRecord, block_height: u64) -> R
 }
 
 fn parse_error(res: &ResponseResult) -> Option<String> {
-    match res.status.as_str() {
+    match res.status.as_deref().unwrap_or("") {
         "err" => res.response.as_str().map(|msg| msg.to_string()),
         "ok" => match &res.response {
             Value::Object(map) => map
@@ -312,13 +318,6 @@ fn parse_error(res: &ResponseResult) -> Option<String> {
     }
 }
 
-fn string_or_default<'de, D>(deserializer: D) -> std::result::Result<String, D::Error>
-where
-    D: Deserializer<'de>,
-{
-    Option::<String>::deserialize(deserializer).map(|value| value.unwrap_or_default())
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -326,7 +325,7 @@ mod tests {
     #[test]
     fn parse_error_from_err_status() {
         let res = ResponseResult {
-            status: "err".to_string(),
+            status: Some("err".to_string()),
             response: serde_json::json!("Invalid nonce: duplicate nonce 1764221206959"),
         };
         assert_eq!(
@@ -338,7 +337,7 @@ mod tests {
     #[test]
     fn parse_error_from_ok_status_with_nested_error() {
         let res = ResponseResult {
-            status: "ok".to_string(),
+            status: Some("ok".to_string()),
             response: serde_json::json!({
                 "type": "order",
                 "data": {
@@ -360,7 +359,7 @@ mod tests {
     #[test]
     fn parse_error_from_ok_status_success() {
         let res = ResponseResult {
-            status: "ok".to_string(),
+            status: Some("ok".to_string()),
             response: serde_json::json!({
                 "type": "order",
                 "data": {

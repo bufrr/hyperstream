@@ -2,11 +2,9 @@ use crate::sorter_client::proto::DataRecord;
 use anyhow::{anyhow, Result};
 use std::path::Path;
 
-pub mod batch;
 pub mod block_merger;
 pub mod blocks;
 pub mod buffered;
-mod fill_types;
 pub mod fills;
 pub mod hash_store;
 pub mod misc_events;

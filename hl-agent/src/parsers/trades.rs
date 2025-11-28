@@ -1,7 +1,6 @@
-use super::fill_types::{parse_fill_line, FillLine, NodeFill};
 use crate::parsers::{
-    drain_complete_lines, line_preview, normalize_tx_hash, trim_line_bytes, Parser,
-    LINE_PREVIEW_LIMIT,
+    fills::{parse_fill_line, FillLine, NodeFill},
+    line_preview, normalize_tx_hash, BufferedLineParser, LineParser, Parser, LINE_PREVIEW_LIMIT,
 };
 use crate::sorter_client::proto::DataRecord;
 use anyhow::{Context, Result};
@@ -15,9 +14,12 @@ use tracing::warn;
 /// Input is identical to the fill parser (`node_trades` / `node_fills_by_block` JSONL files). The
 /// parser buffers fills keyed by trade id (tid) and emits one trade per tid, or single-user trades
 /// when only one fill exists in a block.
-#[derive(Default)]
 pub struct TradesParser {
-    buffer: Vec<u8>,
+    inner: BufferedLineParser<TradesLineParser>,
+}
+
+#[derive(Default)]
+struct TradesLineParser {
     pending: HashMap<u64, Vec<FillForTrade>>,
 }
 
@@ -47,47 +49,21 @@ struct FillForTrade {
 }
 
 impl Parser for TradesParser {
-    fn parse(&mut self, _file_path: &Path, data: &[u8]) -> Result<Vec<DataRecord>> {
-        self.buffer.extend_from_slice(data);
-        let lines = drain_complete_lines(&mut self.buffer);
-        let mut records = Vec::new();
-
-        for raw_line in lines {
-            let line = trim_line_bytes(raw_line);
-            if line.is_empty() {
-                continue;
-            }
-
-            match parse_fill_line(&line) {
-                Ok(FillLine::Batch(batch)) => {
-                    for (user, mut fill) in batch.events {
-                        fill.user = user;
-                        fill.block_height = Some(batch.block_number);
-                        let fill = FillForTrade::from(fill);
-                        self.try_emit_trade(fill, &mut records)?;
-                    }
-                    self.flush_block_single_fill_trades(batch.block_number, &mut records)?;
-                }
-                Ok(FillLine::Single(fill)) => {
-                    let fill = FillForTrade::from(*fill);
-                    self.try_emit_trade(fill, &mut records)?;
-                }
-                Err(err) => {
-                    warn!(
-                        error = %err,
-                        preview = %line_preview(&line, LINE_PREVIEW_LIMIT),
-                        "failed to parse trade fill line as JSON"
-                    );
-                }
-            }
-        }
-
-        Ok(records)
+    fn parse(&mut self, file_path: &Path, data: &[u8]) -> Result<Vec<DataRecord>> {
+        self.inner.parse(file_path, data)
     }
 
     fn backlog_len(&self) -> usize {
         // Account for buffered bytes and pending fills so checkpoints remain safe
-        self.buffer.len() + self.pending.len() * 100
+        self.inner.backlog_len() + self.inner.inner().pending_backlog_len()
+    }
+}
+
+impl Default for TradesParser {
+    fn default() -> Self {
+        Self {
+            inner: BufferedLineParser::new(TradesLineParser::default()),
+        }
     }
 }
 
@@ -107,7 +83,38 @@ impl From<NodeFill> for FillForTrade {
     }
 }
 
-impl TradesParser {
+impl LineParser for TradesLineParser {
+    fn parse_line(&mut self, _file_path: &Path, line: &[u8]) -> Result<Vec<DataRecord>> {
+        let mut records = Vec::new();
+
+        match parse_fill_line(line) {
+            Ok(FillLine::Batch(batch)) => {
+                for (user, mut fill) in batch.events {
+                    fill.user = user;
+                    fill.block_height = Some(batch.block_number);
+                    let fill = FillForTrade::from(fill);
+                    self.try_emit_trade(fill, &mut records)?;
+                }
+                self.flush_block_single_fill_trades(batch.block_number, &mut records)?;
+            }
+            Ok(FillLine::Single(fill)) => {
+                let fill = FillForTrade::from(*fill);
+                self.try_emit_trade(fill, &mut records)?;
+            }
+            Err(err) => {
+                warn!(
+                    error = %err,
+                    preview = %line_preview(line, LINE_PREVIEW_LIMIT),
+                    "failed to parse trade fill line as JSON"
+                );
+            }
+        }
+
+        Ok(records)
+    }
+}
+
+impl TradesLineParser {
     fn try_emit_trade(&mut self, fill: FillForTrade, records: &mut Vec<DataRecord>) -> Result<()> {
         // If tid is 0 (missing), emit immediately as single-user trade
         // Otherwise, try to aggregate by tid for proper 2-user trades
@@ -169,6 +176,10 @@ impl TradesParser {
         }
 
         Ok(())
+    }
+
+    fn pending_backlog_len(&self) -> usize {
+        self.pending.len() * 100
     }
 }
 
