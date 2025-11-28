@@ -4,12 +4,11 @@
 
 use crate::checkpoint::CheckpointDB;
 use crate::config::Config;
-use crate::output_writer::RecordSink;
 use crate::parsers::block_merger::BlockMerger;
 use crate::parsers::hash_store::HashStore;
 use crate::parsers::route_parser;
 use crate::runner::{build_record_sink, resolve_batch_size};
-use crate::tailer::tail_file;
+use crate::tailer::{tail_file, TailerConfig};
 use crate::watcher::{watch_directories, FileEvent, WATCHER_CHANNEL_CAPACITY};
 use anyhow::Result;
 use std::collections::HashMap;
@@ -34,6 +33,15 @@ pub async fn run(config: &Config) -> Result<()> {
     let poll_interval = Duration::from_millis(config.watcher.poll_interval_ms);
     let checkpoint_db = Arc::new(CheckpointDB::new(config.checkpoint_db_path())?);
     let record_sink = build_record_sink(config, cancel_token.clone()).await?;
+    let tailer_config = TailerConfig {
+        checkpoint_db: checkpoint_db.clone(),
+        record_sink: record_sink.clone(),
+        batch_size,
+        poll_interval,
+        bulk_load_warn_bytes: config.performance.bulk_load_warn_bytes,
+        bulk_load_abort_bytes: config.performance.bulk_load_abort_bytes,
+        cancel_token: cancel_token.clone(),
+    };
 
     let (event_tx, mut event_rx) = mpsc::channel(WATCHER_CHANNEL_CAPACITY);
 
@@ -46,16 +54,10 @@ pub async fn run(config: &Config) -> Result<()> {
     if let Err(err) = seed_existing_files(
         &watch_paths,
         &mut active_tailers,
-        checkpoint_db.clone(),
-        record_sink.clone(),
-        poll_interval,
-        batch_size,
+        tailer_config.clone(),
         skip_historical,
         tail_bytes,
         tailer_semaphore.clone(),
-        config.performance.bulk_load_warn_bytes,
-        config.performance.bulk_load_abort_bytes,
-        cancel_token.clone(),
     )
     .await
     {
@@ -96,14 +98,8 @@ pub async fn run(config: &Config) -> Result<()> {
                         spawn_tailer_if_needed(
                             &mut active_tailers,
                             path,
-                            checkpoint_db.clone(),
-                            record_sink.clone(),
-                            poll_interval,
-                            batch_size,
                             tailer_semaphore.clone(),
-                            config.performance.bulk_load_warn_bytes,
-                            config.performance.bulk_load_abort_bytes,
-                            cancel_token.clone(),
+                            tailer_config.clone(),
                         );
                     }
                     None => {
@@ -181,22 +177,16 @@ fn event_path(event: &FileEvent) -> PathBuf {
     }
 }
 
-#[allow(clippy::too_many_arguments)]
 async fn seed_existing_files(
     watch_paths: &[PathBuf],
     active_tailers: &mut HashMap<PathBuf, JoinHandle<()>>,
-    checkpoint_db: Arc<CheckpointDB>,
-    record_sink: Arc<dyn RecordSink>,
-    poll_interval: Duration,
-    batch_size: usize,
+    config: TailerConfig,
     skip_historical: bool,
     tail_bytes: u64,
     tailer_semaphore: Arc<Semaphore>,
-    bulk_load_warn_bytes: u64,
-    bulk_load_abort_bytes: u64,
-    cancel_token: CancellationToken,
 ) -> Result<()> {
     let mut existing_files = discover_existing_files(watch_paths)?;
+    let checkpoint_db = config.checkpoint_db.clone();
 
     // Sort by priority first, then by modification time (NEWEST first)
     existing_files.sort_by(|a, b| {
@@ -236,14 +226,8 @@ async fn seed_existing_files(
         spawn_tailer_if_needed(
             active_tailers,
             path,
-            checkpoint_db.clone(),
-            record_sink.clone(),
-            poll_interval,
-            batch_size,
             tailer_semaphore.clone(),
-            bulk_load_warn_bytes,
-            bulk_load_abort_bytes,
-            cancel_token.clone(),
+            config.clone(),
         );
     }
     Ok(())
@@ -322,18 +306,11 @@ async fn maybe_skip_historical_for_path(
     Ok(())
 }
 
-#[allow(clippy::too_many_arguments)]
 fn spawn_tailer_if_needed(
     active_tailers: &mut HashMap<PathBuf, JoinHandle<()>>,
     path: PathBuf,
-    checkpoint_db: Arc<CheckpointDB>,
-    record_sink: Arc<dyn RecordSink>,
-    poll_interval: Duration,
-    batch_size: usize,
     tailer_semaphore: Arc<Semaphore>,
-    bulk_load_warn_bytes: u64,
-    bulk_load_abort_bytes: u64,
-    cancel_token: CancellationToken,
+    config: TailerConfig,
 ) {
     if let Some(handle) = active_tailers.get(&path) {
         if handle.is_finished() {
@@ -374,7 +351,7 @@ fn spawn_tailer_if_needed(
 
     let tail_path = path.clone();
     let semaphore = tailer_semaphore.clone();
-    let tailer_cancel = cancel_token;
+    let tailer_config = config;
     let handle = tokio::spawn(async move {
         let permit = semaphore.acquire_owned().await;
         if permit.is_err() {
@@ -382,19 +359,7 @@ fn spawn_tailer_if_needed(
             return;
         }
         let _permit = permit.unwrap();
-        if let Err(err) = tail_file(
-            tail_path.clone(),
-            parsers,
-            checkpoint_db,
-            record_sink,
-            batch_size,
-            poll_interval,
-            bulk_load_warn_bytes,
-            bulk_load_abort_bytes,
-            tailer_cancel,
-        )
-        .await
-        {
+        if let Err(err) = tail_file(tail_path.clone(), parsers, tailer_config).await {
             error!(error = %err, path = %tail_path.display(), "tailer terminated with error");
         }
     });

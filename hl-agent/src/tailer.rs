@@ -17,6 +17,18 @@ const DEFAULT_POLL_INTERVAL_MS: u64 = 100;
 const MAX_READ_CHUNK_BYTES: usize = 8 * 1024 * 1024; // 8 MiB per iteration
 const FILE_SIZE_STABLE_POLLS: u32 = 2; // Number of polls with unchanged size to consider file stable
 
+/// Configuration for file tailers.
+#[derive(Clone)]
+pub struct TailerConfig {
+    pub checkpoint_db: Arc<CheckpointDB>,
+    pub record_sink: Arc<dyn RecordSink>,
+    pub batch_size: usize,
+    pub poll_interval: Duration,
+    pub bulk_load_warn_bytes: u64,
+    pub bulk_load_abort_bytes: u64,
+    pub cancel_token: CancellationToken,
+}
+
 async fn sleep_or_cancel(duration: Duration, cancel_token: &CancellationToken) -> bool {
     tokio::select! {
         biased;
@@ -25,18 +37,22 @@ async fn sleep_or_cancel(duration: Duration, cancel_token: &CancellationToken) -
     }
 }
 
-#[allow(clippy::too_many_arguments)]
 pub async fn tail_file(
     file_path: PathBuf,
-    mut active_parsers: Vec<Box<dyn parsers::Parser>>,
-    checkpoint_db: Arc<CheckpointDB>,
-    record_sink: Arc<dyn RecordSink>,
-    batch_size: usize,
-    poll_interval: Duration,
-    bulk_load_warn_bytes: u64,
-    bulk_load_abort_bytes: u64,
-    cancel_token: CancellationToken,
+    active_parsers: Vec<Box<dyn parsers::Parser>>,
+    config: TailerConfig,
 ) -> Result<()> {
+    let TailerConfig {
+        checkpoint_db,
+        record_sink,
+        batch_size,
+        poll_interval,
+        bulk_load_warn_bytes,
+        bulk_load_abort_bytes,
+        cancel_token,
+    } = config;
+
+    let mut active_parsers = active_parsers;
     let checkpoint = checkpoint_db.get(&file_path).await?;
     let mut read_offset = checkpoint.as_ref().map(|rec| rec.byte_offset).unwrap_or(0);
     let initial_line_count = checkpoint.as_ref().map(|rec| rec.line_count).unwrap_or(0);
@@ -59,13 +75,16 @@ pub async fn tail_file(
         return tail_blocks_file_bulk(
             file_path,
             active_parsers,
-            checkpoint_db,
-            record_sink,
-            batch_size,
+            TailerConfig {
+                checkpoint_db,
+                record_sink,
+                batch_size,
+                poll_interval,
+                bulk_load_warn_bytes,
+                bulk_load_abort_bytes,
+                cancel_token,
+            },
             sleep_interval,
-            bulk_load_warn_bytes,
-            bulk_load_abort_bytes,
-            cancel_token,
         )
         .await;
     }
@@ -390,18 +409,23 @@ fn max_line_count(parsers: &[Box<dyn parsers::Parser>]) -> u64 {
 /// 4. Mark file as fully processed in checkpoint
 ///
 /// This eliminates the 60+ second chunked reading for 846MB files, reducing to ~2-3 seconds.
-#[allow(clippy::too_many_arguments)]
 async fn tail_blocks_file_bulk(
     file_path: PathBuf,
-    mut active_parsers: Vec<Box<dyn parsers::Parser>>,
-    checkpoint_db: Arc<CheckpointDB>,
-    record_sink: Arc<dyn RecordSink>,
-    batch_size: usize,
+    active_parsers: Vec<Box<dyn parsers::Parser>>,
+    config: TailerConfig,
     sleep_interval: Duration,
-    bulk_load_warn_bytes: u64,
-    bulk_load_abort_bytes: u64,
-    cancel_token: CancellationToken,
 ) -> Result<()> {
+    let TailerConfig {
+        checkpoint_db,
+        record_sink,
+        batch_size,
+        poll_interval: _,
+        bulk_load_warn_bytes,
+        bulk_load_abort_bytes,
+        cancel_token,
+    } = config;
+
+    let mut active_parsers = active_parsers;
     let checkpoint = checkpoint_db.get(&file_path).await?;
     let initial_offset = checkpoint.as_ref().map(|rec| rec.byte_offset).unwrap_or(0);
     let initial_line_count = checkpoint.as_ref().map(|rec| rec.line_count).unwrap_or(0);
