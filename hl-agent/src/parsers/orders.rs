@@ -15,14 +15,9 @@ use tracing::warn;
 ///
 /// The parser handles both single-event lines and batch envelopes, normalizes hashes, and flattens
 /// the order fields that downstream consumers expect.
+#[derive(Default)]
 pub struct OrdersParser {
     buffer: Vec<u8>,
-}
-
-impl Default for OrdersParser {
-    fn default() -> Self {
-        Self { buffer: Vec::new() }
-    }
 }
 
 #[derive(Serialize, Default)]

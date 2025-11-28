@@ -6,6 +6,7 @@ use std::path::PathBuf;
 use std::time::Duration;
 use tokio::sync::mpsc::{self, error::TrySendError};
 use tokio::time::sleep;
+use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info, warn};
 
 #[derive(Debug, Clone)]
@@ -20,6 +21,7 @@ pub async fn watch_directories(
     watch_paths: Vec<PathBuf>,
     poll_interval: Duration,
     event_tx: mpsc::Sender<FileEvent>,
+    cancel_token: CancellationToken,
 ) -> Result<()> {
     let watcher_tx = event_tx.clone();
 
@@ -45,8 +47,17 @@ pub async fn watch_directories(
 
     // Keep the watcher alive for the lifetime of the process.
     loop {
-        sleep(Duration::from_secs(3600)).await;
+        tokio::select! {
+            biased;
+            _ = cancel_token.cancelled() => {
+                info!("file watcher received shutdown signal");
+                break;
+            }
+            _ = sleep(Duration::from_secs(3600)) => {}
+        }
     }
+
+    Ok(())
 }
 
 fn handle_event(event_tx: &mpsc::Sender<FileEvent>, event: Event) {

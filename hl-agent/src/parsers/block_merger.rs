@@ -55,6 +55,15 @@ pub struct BlockMerger {
 
 static GLOBAL_BLOCK_MERGER: OnceLock<Arc<BlockMerger>> = OnceLock::new();
 
+impl Default for BlockMerger {
+    fn default() -> Self {
+        Self {
+            hash_store: HashStore::global(),
+            stats: MergerStats::default(),
+        }
+    }
+}
+
 impl BlockMerger {
     /// Create a new BlockMerger wired to the global HashStore.
     pub fn new() -> Self {

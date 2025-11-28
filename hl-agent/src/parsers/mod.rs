@@ -63,6 +63,14 @@ pub trait Parser: Send {
     /// current file offset so that restarted runs re-feed any partial lines still in memory. A
     /// parser that performs its own buffering must reflect that state here.
     fn backlog_len(&self) -> usize;
+
+    /// Initialize the parser's internal line counter when resuming from a checkpoint.
+    fn set_initial_line_count(&mut self, _count: u64) {}
+
+    /// Return how many complete lines have been processed so far.
+    fn get_line_count(&self) -> u64 {
+        0
+    }
 }
 
 /// Routes a file path to the appropriate parser(s).

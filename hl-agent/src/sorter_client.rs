@@ -4,6 +4,7 @@ use std::time::Duration;
 use tokio::sync::{mpsc, Mutex};
 use tokio::time::sleep;
 use tokio_stream::wrappers::ReceiverStream;
+use tokio_util::sync::CancellationToken;
 use tonic::transport::Channel;
 use tonic::Request;
 use tracing::{error, warn};
@@ -27,6 +28,7 @@ struct BatchSenderInner {
     agent_id: String,
     max_retries: usize,
     base_backoff: Duration,
+    cancel_token: CancellationToken,
 }
 
 impl BatchSender {
@@ -62,8 +64,7 @@ impl BatchSender {
                     attempt += 1;
                     if attempt > self.inner.max_retries {
                         return Err(anyhow!(
-                            "failed to enqueue batch after {} attempts: {err}",
-                            attempt
+                            "failed to enqueue batch after {attempt} attempts: {err}"
                         ));
                     }
 
@@ -75,7 +76,13 @@ impl BatchSender {
                     );
 
                     self.reconnect_stream().await?;
-                    sleep(backoff).await;
+                    tokio::select! {
+                        biased;
+                        _ = self.inner.cancel_token.cancelled() => {
+                            return Err(anyhow!("shutdown"));
+                        }
+                        _ = sleep(backoff) => {}
+                    }
                     backoff = std::cmp::min(backoff.saturating_mul(2), Duration::from_secs(30));
                 }
             }
@@ -134,6 +141,7 @@ impl SorterClient {
         &mut self,
         max_retries: usize,
         base_backoff: Duration,
+        cancel_token: CancellationToken,
     ) -> Result<BatchSender> {
         // Limit in-flight batches so a slow gRPC sink can't grow memory without bound.
         let (tx, rx) = mpsc::channel(1000);
@@ -155,6 +163,7 @@ impl SorterClient {
                 agent_id: self.agent_id.clone(),
                 max_retries,
                 base_backoff,
+                cancel_token,
             }),
         })
     }

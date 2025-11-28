@@ -124,7 +124,7 @@ async fn stream_once(ws_url: &str, redis_conn: &mut ConnectionManager) -> Result
     let sub = SubscriptionMessage::new(ExplorerSubscription::ExplorerBlock);
     let sub_msg = serde_json::to_string(&sub).context("Failed to serialize subscription")?;
     write
-        .send(Message::Text(sub_msg))
+        .send(Message::Text(sub_msg.into()))
         .await
         .context("Failed to send subscription request")?;
     info!("Subscribed to explorerBlock channel");

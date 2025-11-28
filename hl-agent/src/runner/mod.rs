@@ -11,6 +11,7 @@ use crate::sorter_client::SorterClient;
 use anyhow::{Context, Result};
 use std::sync::Arc;
 use std::time::Duration;
+use tokio_util::sync::CancellationToken;
 use tracing::info;
 
 /// Environment variable to force immediate batch flushing (testing mode).
@@ -19,7 +20,10 @@ pub const FORCE_FLUSH_ENV: &str = "HL_AGENT_FORCE_FLUSH";
 /// Build the appropriate record sink based on configuration.
 ///
 /// Returns either a SorterClient (for gRPC streaming) or FileWriter (for local output).
-pub async fn build_record_sink(config: &Config) -> Result<Arc<dyn RecordSink>> {
+pub async fn build_record_sink(
+    config: &Config,
+    cancel_token: CancellationToken,
+) -> Result<Arc<dyn RecordSink>> {
     if let Some(endpoint) = config
         .sorter
         .endpoint
@@ -37,6 +41,7 @@ pub async fn build_record_sink(config: &Config) -> Result<Arc<dyn RecordSink>> {
             .start_stream(
                 config.performance.sink_retry_max_attempts,
                 Duration::from_millis(config.performance.sink_retry_base_delay_ms),
+                cancel_token,
             )
             .await
             .context("failed to establish sorter stream")?;

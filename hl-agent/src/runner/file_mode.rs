@@ -16,31 +16,26 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, UNIX_EPOCH};
+use tokio::fs::File;
+use tokio::io::AsyncReadExt;
 use tokio::sync::{mpsc, Semaphore};
 use tokio::task::JoinHandle;
+use tokio::time::sleep;
+use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info, warn};
 
 /// Run the agent in file mode.
 pub async fn run(config: &Config) -> Result<()> {
     info!("hl-agent starting in file mode");
 
+    let cancel_token = CancellationToken::new();
     let batch_size = resolve_batch_size(config.sorter.batch_size);
     let watch_paths = config.watch_paths();
     let poll_interval = Duration::from_millis(config.watcher.poll_interval_ms);
     let checkpoint_db = Arc::new(CheckpointDB::new(config.checkpoint_db_path())?);
-    let record_sink = build_record_sink(config).await?;
+    let record_sink = build_record_sink(config, cancel_token.clone()).await?;
 
     let (event_tx, mut event_rx) = mpsc::channel(WATCHER_CHANNEL_CAPACITY);
-
-    let watcher_handle = tokio::spawn({
-        let paths = watch_paths.clone();
-        let event_tx = event_tx.clone();
-        async move {
-            if let Err(err) = watch_directories(paths, poll_interval, event_tx).await {
-                error!(error = %err, "file watcher exited unexpectedly");
-            }
-        }
-    });
 
     let mut active_tailers: HashMap<PathBuf, JoinHandle<()>> = HashMap::new();
     let tailer_semaphore = Arc::new(Semaphore::new(config.performance.max_concurrent_tailers));
@@ -60,14 +55,28 @@ pub async fn run(config: &Config) -> Result<()> {
         tailer_semaphore.clone(),
         config.performance.bulk_load_warn_bytes,
         config.performance.bulk_load_abort_bytes,
+        cancel_token.clone(),
     )
     .await
     {
         warn!(error = %err, "failed to discover existing files on startup");
     }
 
+    let mut watcher_handle = tokio::spawn({
+        let paths = watch_paths.clone();
+        let event_tx = event_tx.clone();
+        let cancel_token = cancel_token.clone();
+        async move {
+            if let Err(err) = watch_directories(paths, poll_interval, event_tx, cancel_token).await
+            {
+                error!(error = %err, "file watcher exited unexpectedly");
+            }
+        }
+    });
+
     info!("hl-agent started; awaiting file events");
 
+    let mut shutdown_reason = "event channel closed";
     loop {
         tokio::select! {
             maybe_event = event_rx.recv() => {
@@ -94,6 +103,7 @@ pub async fn run(config: &Config) -> Result<()> {
                             tailer_semaphore.clone(),
                             config.performance.bulk_load_warn_bytes,
                             config.performance.bulk_load_abort_bytes,
+                            cancel_token.clone(),
                         );
                     }
                     None => {
@@ -107,20 +117,56 @@ pub async fn run(config: &Config) -> Result<()> {
                     error!(error = %err, "failed while waiting for shutdown signal");
                 }
                 info!("shutdown signal received");
+                shutdown_reason = "signal";
                 break;
             }
         }
     }
 
+    info!(reason = shutdown_reason, "initiating shutdown");
+    cancel_token.cancel();
+
+    let shutdown_timeout = Duration::from_secs(5);
+
     info!("stopping tailers");
-    for (path, handle) in active_tailers.drain() {
-        if !handle.is_finished() {
-            handle.abort();
+    for (path, mut handle) in active_tailers.drain() {
+        let timeout = sleep(shutdown_timeout);
+        tokio::pin!(timeout);
+
+        let result = tokio::select! {
+            res = &mut handle => Some(res),
+            _ = &mut timeout => None,
+        };
+
+        match result {
+            Some(Ok(())) => {
+                info!(path = %path.display(), "tailer stopped");
+            }
+            Some(Err(err)) => {
+                warn!(path = %path.display(), error = %err, "tailer exited with error during shutdown");
+            }
+            None => {
+                warn!(path = %path.display(), "tailer did not stop within timeout; aborting");
+                handle.abort();
+            }
         }
-        info!(path = %path.display(), "tailer stopped");
     }
 
-    watcher_handle.abort();
+    let watcher_timeout = sleep(shutdown_timeout);
+    tokio::pin!(watcher_timeout);
+    let watcher_result = tokio::select! {
+        res = &mut watcher_handle => Some(res),
+        _ = &mut watcher_timeout => None,
+    };
+
+    match watcher_result {
+        Some(Ok(())) => info!("file watcher stopped"),
+        Some(Err(err)) => warn!(error = %err, "file watcher exited with error during shutdown"),
+        None => {
+            warn!("file watcher did not stop within timeout; aborting");
+            watcher_handle.abort();
+        }
+    }
 
     // Log final merger statistics
     BlockMerger::global().log_stats();
@@ -148,6 +194,7 @@ async fn seed_existing_files(
     tailer_semaphore: Arc<Semaphore>,
     bulk_load_warn_bytes: u64,
     bulk_load_abort_bytes: u64,
+    cancel_token: CancellationToken,
 ) -> Result<()> {
     let mut existing_files = discover_existing_files(watch_paths)?;
 
@@ -196,6 +243,7 @@ async fn seed_existing_files(
             tailer_semaphore.clone(),
             bulk_load_warn_bytes,
             bulk_load_abort_bytes,
+            cancel_token.clone(),
         );
     }
     Ok(())
@@ -230,8 +278,27 @@ async fn maybe_skip_historical_for_path(
         file_size.saturating_sub(tail_bytes)
     };
 
+    let line_count = if start_offset == 0 || !is_replica_cmds_path(path) {
+        0
+    } else {
+        let file = File::open(path).await?;
+        let mut reader = file.take(start_offset);
+        let mut buf = vec![0u8; 8192];
+        let mut newline_count: u64 = 0;
+
+        loop {
+            let bytes_read = reader.read(&mut buf).await?;
+            if bytes_read == 0 {
+                break;
+            }
+            newline_count += buf[..bytes_read].iter().filter(|&&b| b == b'\n').count() as u64;
+        }
+
+        newline_count
+    };
+
     checkpoint_db
-        .set_offset(path, start_offset, file_size, last_modified_ts)
+        .set_offset(path, start_offset, file_size, last_modified_ts, line_count)
         .await?;
 
     if tail_bytes == 0 {
@@ -255,6 +322,7 @@ async fn maybe_skip_historical_for_path(
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 fn spawn_tailer_if_needed(
     active_tailers: &mut HashMap<PathBuf, JoinHandle<()>>,
     path: PathBuf,
@@ -265,6 +333,7 @@ fn spawn_tailer_if_needed(
     tailer_semaphore: Arc<Semaphore>,
     bulk_load_warn_bytes: u64,
     bulk_load_abort_bytes: u64,
+    cancel_token: CancellationToken,
 ) {
     if let Some(handle) = active_tailers.get(&path) {
         if handle.is_finished() {
@@ -305,6 +374,7 @@ fn spawn_tailer_if_needed(
 
     let tail_path = path.clone();
     let semaphore = tailer_semaphore.clone();
+    let tailer_cancel = cancel_token;
     let handle = tokio::spawn(async move {
         let permit = semaphore.acquire_owned().await;
         if permit.is_err() {
@@ -321,6 +391,7 @@ fn spawn_tailer_if_needed(
             poll_interval,
             bulk_load_warn_bytes,
             bulk_load_abort_bytes,
+            tailer_cancel,
         )
         .await
         {
@@ -329,6 +400,12 @@ fn spawn_tailer_if_needed(
     });
 
     active_tailers.insert(path, handle);
+}
+
+fn is_replica_cmds_path(path: &Path) -> bool {
+    path.iter()
+        .filter_map(|c| c.to_str())
+        .any(|component| component == "replica_cmds")
 }
 
 fn file_priority(path: &Path) -> u8 {

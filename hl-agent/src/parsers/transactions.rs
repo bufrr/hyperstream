@@ -145,8 +145,10 @@ impl Parser for TransactionsParser {
                 continue;
             }
 
-            // Calculate block height: starting_block + line_count
-            let calculated_height = self.starting_block.map(|start| start + self.line_count);
+            // Calculate block height: starting_block + line_count + 1
+            // Files are named with starting block but first line is actually starting_block + 1
+            // e.g., file "810800000" contains blocks 810800001 to 810810000
+            let calculated_height = self.starting_block.map(|start| start + self.line_count + 1);
 
             match serde_json::from_slice::<ReplicaCmd>(&line) {
                 Ok(cmd) => {
@@ -170,6 +172,14 @@ impl Parser for TransactionsParser {
 
     fn backlog_len(&self) -> usize {
         self.buffer.len()
+    }
+
+    fn set_initial_line_count(&mut self, count: u64) {
+        self.line_count = count;
+    }
+
+    fn get_line_count(&self) -> u64 {
+        self.line_count
     }
 }
 

@@ -18,6 +18,7 @@ pub struct CheckpointRecord {
     pub file_size: u64,
     pub last_modified_ts: i64,
     pub updated_at: i64,
+    pub line_count: u64,
 }
 
 impl CheckpointDB {
@@ -45,7 +46,7 @@ impl CheckpointDB {
             let mut stmt = conn
                 .prepare(
                     "
-                    SELECT file_path, byte_offset, file_size, last_modified_ts, updated_at
+                    SELECT file_path, byte_offset, file_size, last_modified_ts, updated_at, line_count
                     FROM checkpoints
                     WHERE file_path = ?1
                     ",
@@ -61,6 +62,7 @@ impl CheckpointDB {
                         file_size: row.get::<_, i64>(2)? as u64,
                         last_modified_ts: row.get::<_, i64>(3)?,
                         updated_at: row.get::<_, i64>(4)?,
+                        line_count: row.get::<_, i64>(5)? as u64,
                     })
                 })
                 .optional()
@@ -80,12 +82,22 @@ impl CheckpointDB {
             .unwrap_or(0))
     }
 
+    #[allow(dead_code)]
+    pub async fn get_line_count(&self, file_path: &Path) -> Result<u64> {
+        Ok(self
+            .get(file_path)
+            .await?
+            .map(|rec| rec.line_count)
+            .unwrap_or(0))
+    }
+
     pub async fn set_offset(
         &self,
         file_path: &Path,
         offset: u64,
         file_size: u64,
         last_modified_ts: i64,
+        line_count: u64,
     ) -> Result<()> {
         let db_path = self.path.clone();
         let path = normalize_path(file_path);
@@ -99,21 +111,24 @@ impl CheckpointDB {
                     byte_offset,
                     file_size,
                     last_modified_ts,
-                    updated_at
+                    updated_at,
+                    line_count
                 )
-                VALUES (?1, ?2, ?3, ?4, ?5)
+                VALUES (?1, ?2, ?3, ?4, ?5, ?6)
                 ON CONFLICT(file_path) DO UPDATE SET
                     byte_offset = excluded.byte_offset,
                     file_size = excluded.file_size,
                     last_modified_ts = excluded.last_modified_ts,
-                    updated_at = excluded.updated_at
+                    updated_at = excluded.updated_at,
+                    line_count = excluded.line_count
                 ",
                 params![
                     path,
                     offset as i64,
                     file_size as i64,
                     last_modified_ts,
-                    timestamp
+                    timestamp,
+                    line_count as i64
                 ],
             )
             .context("failed to upsert checkpoint record")?;
@@ -150,11 +165,29 @@ fn initialize_schema(conn: &Connection) -> Result<()> {
             byte_offset INTEGER NOT NULL,
             file_size INTEGER NOT NULL,
             last_modified_ts INTEGER NOT NULL,
-            updated_at INTEGER NOT NULL
+            updated_at INTEGER NOT NULL,
+            line_count INTEGER NOT NULL DEFAULT 0
         );
         ",
     )
     .context("failed to create checkpoints table")?;
+
+    let has_line_count: bool = conn
+        .query_row(
+            "SELECT 1 FROM pragma_table_info('checkpoints') WHERE name = 'line_count'",
+            [],
+            |_| Ok(()),
+        )
+        .optional()?
+        .is_some();
+
+    if !has_line_count {
+        conn.execute(
+            "ALTER TABLE checkpoints ADD COLUMN line_count INTEGER NOT NULL DEFAULT 0",
+            [],
+        )
+        .context("failed to add line_count column to checkpoints table")?;
+    }
 
     Ok(())
 }

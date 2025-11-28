@@ -10,12 +10,22 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tokio::fs;
 use tokio::io::{AsyncReadExt, AsyncSeekExt};
 use tokio::time::sleep;
+use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info, warn};
 
 const DEFAULT_POLL_INTERVAL_MS: u64 = 100;
 const MAX_READ_CHUNK_BYTES: usize = 8 * 1024 * 1024; // 8 MiB per iteration
 const FILE_SIZE_STABLE_POLLS: u32 = 2; // Number of polls with unchanged size to consider file stable
 
+async fn sleep_or_cancel(duration: Duration, cancel_token: &CancellationToken) -> bool {
+    tokio::select! {
+        biased;
+        _ = cancel_token.cancelled() => true,
+        _ = sleep(duration) => false,
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
 pub async fn tail_file(
     file_path: PathBuf,
     mut active_parsers: Vec<Box<dyn parsers::Parser>>,
@@ -25,8 +35,14 @@ pub async fn tail_file(
     poll_interval: Duration,
     bulk_load_warn_bytes: u64,
     bulk_load_abort_bytes: u64,
+    cancel_token: CancellationToken,
 ) -> Result<()> {
-    let mut read_offset = checkpoint_db.get_offset(&file_path).await?;
+    let checkpoint = checkpoint_db.get(&file_path).await?;
+    let mut read_offset = checkpoint.as_ref().map(|rec| rec.byte_offset).unwrap_or(0);
+    let initial_line_count = checkpoint.as_ref().map(|rec| rec.line_count).unwrap_or(0);
+    for parser in active_parsers.iter_mut() {
+        parser.set_initial_line_count(initial_line_count);
+    }
     let sleep_interval = if poll_interval.is_zero() {
         Duration::from_millis(DEFAULT_POLL_INTERVAL_MS)
     } else {
@@ -49,6 +65,7 @@ pub async fn tail_file(
             sleep_interval,
             bulk_load_warn_bytes,
             bulk_load_abort_bytes,
+            cancel_token,
         )
         .await;
     }
@@ -66,7 +83,9 @@ pub async fn tail_file(
                     path = %file_path.display(),
                     "metadata unavailable; retrying"
                 );
-                sleep(sleep_interval).await;
+                if sleep_or_cancel(sleep_interval, &cancel_token).await {
+                    return Ok(());
+                }
                 continue;
             }
         };
@@ -87,10 +106,15 @@ pub async fn tail_file(
             );
             read_offset = 0;
             active_parsers = parsers::route_parser(&file_path)?;
+            for parser in active_parsers.iter_mut() {
+                parser.set_initial_line_count(0);
+            }
             checkpoint_db
-                .set_offset(&file_path, 0, file_size, last_modified_ts)
+                .set_offset(&file_path, 0, file_size, last_modified_ts, 0)
                 .await?;
-            sleep(sleep_interval).await;
+            if sleep_or_cancel(sleep_interval, &cancel_token).await {
+                return Ok(());
+            }
             continue;
         }
 
@@ -99,14 +123,18 @@ pub async fn tail_file(
             let bytes_available = file_size.saturating_sub(chunk_start);
             let bytes_to_read = bytes_available.min(MAX_READ_CHUNK_BYTES as u64) as usize;
             if bytes_to_read == 0 {
-                sleep(sleep_interval).await;
+                if sleep_or_cancel(sleep_interval, &cancel_token).await {
+                    return Ok(());
+                }
                 continue;
             }
 
             match read_new_bytes(&file_path, chunk_start, bytes_to_read).await {
                 Ok(buffer) => {
                     if buffer.is_empty() {
-                        sleep(sleep_interval).await;
+                        if sleep_or_cancel(sleep_interval, &cancel_token).await {
+                            return Ok(());
+                        }
                         continue;
                     }
 
@@ -156,6 +184,7 @@ pub async fn tail_file(
 
                     if parse_failed {
                         read_offset = next_read_offset;
+                        let line_count = max_line_count(&active_parsers);
                         // Persist checkpoint even when parsing fails to avoid re-reading corrupt data
                         if let Ok(meta) = fs::metadata(&file_path).await {
                             let file_size = meta.len();
@@ -165,10 +194,18 @@ pub async fn tail_file(
                                 .and_then(system_time_seconds)
                                 .unwrap_or_default();
                             let _ = checkpoint_db
-                                .set_offset(&file_path, read_offset, file_size, last_modified_ts)
+                                .set_offset(
+                                    &file_path,
+                                    read_offset,
+                                    file_size,
+                                    last_modified_ts,
+                                    line_count,
+                                )
                                 .await;
                         }
-                        sleep(sleep_interval).await;
+                        if sleep_or_cancel(sleep_interval, &cancel_token).await {
+                            return Ok(());
+                        }
                         continue;
                     }
 
@@ -192,6 +229,7 @@ pub async fn tail_file(
                         .max()
                         .unwrap_or(0);
                     let checkpoint_offset = read_offset.saturating_sub(backlog as u64);
+                    let line_count = max_line_count(&active_parsers);
 
                     let had_records = !records.is_empty();
                     if had_records {
@@ -270,11 +308,19 @@ pub async fn tail_file(
                     }
 
                     checkpoint_db
-                        .set_offset(&file_path, checkpoint_offset, file_size, last_modified_ts)
+                        .set_offset(
+                            &file_path,
+                            checkpoint_offset,
+                            file_size,
+                            last_modified_ts,
+                            line_count,
+                        )
                         .await?;
 
                     if !had_records {
-                        sleep(sleep_interval).await;
+                        if sleep_or_cancel(sleep_interval, &cancel_token).await {
+                            return Ok(());
+                        }
                         continue;
                     }
                 }
@@ -288,7 +334,9 @@ pub async fn tail_file(
             }
         }
 
-        sleep(sleep_interval).await;
+        if sleep_or_cancel(sleep_interval, &cancel_token).await {
+            return Ok(());
+        }
     }
 }
 
@@ -325,6 +373,14 @@ fn system_time_seconds(time: SystemTime) -> Option<i64> {
         .map(|duration| duration.as_secs() as i64)
 }
 
+fn max_line_count(parsers: &[Box<dyn parsers::Parser>]) -> u64 {
+    parsers
+        .iter()
+        .map(|parser| parser.get_line_count())
+        .max()
+        .unwrap_or(0)
+}
+
 /// Specialized tailer for periodic_abci_states files that bulk loads complete MessagePack objects.
 ///
 /// Strategy:
@@ -334,6 +390,7 @@ fn system_time_seconds(time: SystemTime) -> Option<i64> {
 /// 4. Mark file as fully processed in checkpoint
 ///
 /// This eliminates the 60+ second chunked reading for 846MB files, reducing to ~2-3 seconds.
+#[allow(clippy::too_many_arguments)]
 async fn tail_blocks_file_bulk(
     file_path: PathBuf,
     mut active_parsers: Vec<Box<dyn parsers::Parser>>,
@@ -343,8 +400,14 @@ async fn tail_blocks_file_bulk(
     sleep_interval: Duration,
     bulk_load_warn_bytes: u64,
     bulk_load_abort_bytes: u64,
+    cancel_token: CancellationToken,
 ) -> Result<()> {
-    let initial_offset = checkpoint_db.get_offset(&file_path).await?;
+    let checkpoint = checkpoint_db.get(&file_path).await?;
+    let initial_offset = checkpoint.as_ref().map(|rec| rec.byte_offset).unwrap_or(0);
+    let initial_line_count = checkpoint.as_ref().map(|rec| rec.line_count).unwrap_or(0);
+    for parser in active_parsers.iter_mut() {
+        parser.set_initial_line_count(initial_line_count);
+    }
 
     info!(
         path = %file_path.display(),
@@ -367,7 +430,9 @@ async fn tail_blocks_file_bulk(
                     path = %file_path.display(),
                     "metadata unavailable; retrying"
                 );
-                sleep(sleep_interval).await;
+                if sleep_or_cancel(sleep_interval, &cancel_token).await {
+                    return Ok(());
+                }
                 continue;
             }
         };
@@ -387,7 +452,9 @@ async fn tail_blocks_file_bulk(
                 checkpoint_offset = checkpoint_offset,
                 "file already fully processed; monitoring for changes"
             );
-            sleep(sleep_interval).await;
+            if sleep_or_cancel(sleep_interval, &cancel_token).await {
+                return Ok(());
+            }
             last_seen_size = Some(current_size);
             continue;
         }
@@ -418,7 +485,9 @@ async fn tail_blocks_file_bulk(
 
         // Wait for file to stabilize before bulk loading
         if stable_count < FILE_SIZE_STABLE_POLLS {
-            sleep(sleep_interval).await;
+            if sleep_or_cancel(sleep_interval, &cancel_token).await {
+                return Ok(());
+            }
             continue;
         }
 
@@ -466,7 +535,9 @@ async fn tail_blocks_file_bulk(
             );
             stable_count = 0;
             last_seen_size = Some(current_size);
-            sleep(sleep_interval).await;
+            if sleep_or_cancel(sleep_interval, &cancel_token).await {
+                return Ok(());
+            }
             continue;
         }
 
@@ -474,7 +545,9 @@ async fn tail_blocks_file_bulk(
             Ok(buffer) => {
                 if buffer.is_empty() {
                     warn!(path = %file_path.display(), "bulk load returned empty buffer");
-                    sleep(sleep_interval).await;
+                    if sleep_or_cancel(sleep_interval, &cancel_token).await {
+                        return Ok(());
+                    }
                     continue;
                 }
 
@@ -520,7 +593,9 @@ async fn tail_blocks_file_bulk(
                     // Reset for next attempt
                     stable_count = 0;
                     last_seen_size = None;
-                    sleep(sleep_interval).await;
+                    if sleep_or_cancel(sleep_interval, &cancel_token).await {
+                        return Ok(());
+                    }
                     continue;
                 }
 
@@ -535,6 +610,7 @@ async fn tail_blocks_file_bulk(
                 );
 
                 let next_offset = checkpoint_offset.saturating_add(buffer.len() as u64);
+                let line_count = max_line_count(&active_parsers);
 
                 // Send records in batches
                 if !records.is_empty() {
@@ -614,6 +690,7 @@ async fn tail_blocks_file_bulk(
                         next_offset.min(current_size),
                         current_size,
                         last_modified_ts,
+                        line_count,
                     )
                     .await?;
 
@@ -638,6 +715,8 @@ async fn tail_blocks_file_bulk(
             }
         }
 
-        sleep(sleep_interval).await;
+        if sleep_or_cancel(sleep_interval, &cancel_token).await {
+            return Ok(());
+        }
     }
 }
