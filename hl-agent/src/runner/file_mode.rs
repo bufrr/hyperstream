@@ -365,16 +365,20 @@ async fn maybe_skip_historical_for_path(
         return Ok(());
     }
 
-    // For existing files (not newly created), check if checkpoint already exists
-    let existing_checkpoint = checkpoint_db.get(path).await?;
-    if existing_checkpoint.is_some() {
-        // Checkpoint already exists, don't modify it
+    // When skip_historical=false, respect existing checkpoints (resume where we left off)
+    if !skip_historical {
+        // Check if checkpoint already exists
+        let existing_checkpoint = checkpoint_db.get(path).await?;
+        if existing_checkpoint.is_some() {
+            // Checkpoint exists and we're not skipping history - respect it
+            return Ok(());
+        }
+        // No checkpoint exists and skip_historical=false - start from beginning (offset 0)
         return Ok(());
     }
 
-    if !skip_historical {
-        return Ok(());
-    }
+    // When skip_historical=true, ALWAYS skip to end/tail, ignoring any existing checkpoint
+    // This ensures we only process new data going forward, even after restarts
 
     let metadata = tokio::fs::metadata(path).await?;
     let last_modified = metadata.modified().unwrap_or(UNIX_EPOCH);
