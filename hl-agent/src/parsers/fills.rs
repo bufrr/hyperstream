@@ -194,34 +194,55 @@ impl LineParser for FillsLineParser {
 
         Ok(records)
     }
+
+    fn parser_type(&self) -> &'static str {
+        "fills"
+    }
 }
 
 fn node_fill_to_record(node_fill: NodeFill) -> Result<DataRecord> {
-    let block_height = node_fill.block_height;
-    // System-triggered fills use a zero hash; drop it so sorter doesn't fabricate tx ids.
-    let tx_hash = normalize_tx_hash(&node_fill.hash);
+    let NodeFill {
+        user,
+        coin,
+        px,
+        sz,
+        side,
+        time,
+        start_position,
+        dir,
+        closed_pnl,
+        hash,
+        oid,
+        crossed,
+        fee,
+        tid,
+        fee_token,
+        liquidation,
+        block_height,
+        ..
+    } = node_fill;
 
-    // Extract user for tuple format
-    let user = node_fill.user.clone();
-    let timestamp = node_fill.time;
+    // System-triggered fills use a zero hash; drop it so sorter doesn't fabricate tx ids.
+    let tx_hash = normalize_tx_hash(&hash);
+    let timestamp = time;
 
     // Build fill details (without user)
     let fill_details = FillDetails {
-        coin: node_fill.coin.clone(),
-        px: node_fill.px,
-        sz: node_fill.sz,
-        side: node_fill.side,
-        time: node_fill.time,
-        start_position: node_fill.start_position,
-        dir: node_fill.dir,
-        closed_pnl: node_fill.closed_pnl,
-        hash: node_fill.hash,
-        oid: node_fill.oid,
-        crossed: node_fill.crossed,
-        fee: node_fill.fee,
-        tid: node_fill.tid,
-        fee_token: node_fill.fee_token,
-        liquidation: node_fill.liquidation,
+        coin,
+        px,
+        sz,
+        side,
+        time,
+        start_position,
+        dir,
+        closed_pnl,
+        hash,
+        oid,
+        crossed,
+        fee,
+        tid,
+        fee_token,
+        liquidation,
     };
 
     // Serialize as tuple: [user, fillDetails]

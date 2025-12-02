@@ -1,0 +1,201 @@
+groups:
+  - name: hl-agent-latency
+    interval: 30s
+    rules:
+      # Detect recent parse activity (used to gate idle fallbacks)
+      - record: hl_agent:parse_duration_seconds:active5m
+        expr: sum by (parser_type) (increase(hl_agent_parse_duration_seconds_count[5m])) > 0
+
+      # Pre-aggregate histogram buckets for parse duration
+      - record: hl_agent:parse_duration_seconds_bucket:rate5m
+        expr: sum by (le, parser_type) (rate(hl_agent_parse_duration_seconds_bucket[5m]))
+
+      # Last observed buckets over a long window so we can surface values while idle
+      - record: hl_agent:parse_duration_seconds_bucket:last30d
+        expr: sum by (le, parser_type) (last_over_time(hl_agent_parse_duration_seconds_bucket[30d]))
+
+      # Parse duration percentiles (p50, p95, p99)
+      - record: hl_agent:parse_duration_seconds:p50
+        expr: histogram_quantile(0.50, hl_agent:parse_duration_seconds_bucket:rate5m)
+
+      - record: hl_agent:parse_duration_seconds:p95
+        expr: histogram_quantile(0.95, hl_agent:parse_duration_seconds_bucket:rate5m)
+
+      - record: hl_agent:parse_duration_seconds:p99
+        expr: histogram_quantile(0.99, hl_agent:parse_duration_seconds_bucket:rate5m)
+
+      # Idle-safe percentiles: use real-time rates when active, fall back to last buckets when idle
+      - record: hl_agent:parse_duration_seconds:p50:idle_safe
+        expr: (
+                histogram_quantile(0.50, hl_agent:parse_duration_seconds_bucket:rate5m)
+                and on (parser_type) hl_agent:parse_duration_seconds:active5m
+              )
+              or on (parser_type)
+              (
+                histogram_quantile(0.50, hl_agent:parse_duration_seconds_bucket:last30d)
+                unless hl_agent:parse_duration_seconds:active5m
+              )
+
+      - record: hl_agent:parse_duration_seconds:p95:idle_safe
+        expr: (
+                histogram_quantile(0.95, hl_agent:parse_duration_seconds_bucket:rate5m)
+                and on (parser_type) hl_agent:parse_duration_seconds:active5m
+              )
+              or on (parser_type)
+              (
+                histogram_quantile(0.95, hl_agent:parse_duration_seconds_bucket:last30d)
+                unless hl_agent:parse_duration_seconds:active5m
+              )
+
+      - record: hl_agent:parse_duration_seconds:p99:idle_safe
+        expr: (
+                histogram_quantile(0.99, hl_agent:parse_duration_seconds_bucket:rate5m)
+                and on (parser_type) hl_agent:parse_duration_seconds:active5m
+              )
+              or on (parser_type)
+              (
+                histogram_quantile(0.99, hl_agent:parse_duration_seconds_bucket:last30d)
+                unless hl_agent:parse_duration_seconds:active5m
+              )
+
+  - name: hl-agent-cache
+    interval: 30s
+    rules:
+      # Detect cache activity over the last 5m
+      - record: hl_agent:redis_cache:active5m
+        expr: sum(rate(hl_agent_redis_cache_total[5m])) > 0
+
+      # Redis cache hit rate (smoothed over 5m)
+      - record: hl_agent:redis_cache:hit_rate
+        expr: sum(rate(hl_agent_redis_cache_total{result="hit"}[5m])) / clamp_min(sum(rate(hl_agent_redis_cache_total[5m])), 0.001)
+
+      # Idle-safe cache hit rate: prefer real-time rates, otherwise use last counters
+      - record: hl_agent:redis_cache:hit_rate:idle_safe
+        expr: (
+                hl_agent:redis_cache:hit_rate
+                and hl_agent:redis_cache:active5m
+              )
+              or (
+                (sum(hl_agent_redis_cache_total{result="hit"}) / clamp_min(sum(hl_agent_redis_cache_total), 1))
+                unless hl_agent:redis_cache:active5m
+              )
+
+  - name: hl-agent-validation
+    interval: 30s
+    rules:
+      # Detect validation activity over the last 5m
+      - record: hl_agent:block_validation_failures:active5m
+        expr: sum by (reason) (rate(hl_agent_block_validation_failures_total[5m])) > 0
+
+      # Block validation failure rate by reason
+      - record: hl_agent:block_validation_failures:rate5m
+        expr: sum by (reason) (rate(hl_agent_block_validation_failures_total[5m]))
+
+      # Idle-safe validation failures: show rate when active, last totals when idle
+      - record: hl_agent:block_validation_failures:idle_safe
+        expr: (
+                hl_agent:block_validation_failures:rate5m
+                and on (reason) hl_agent:block_validation_failures:active5m
+              )
+              or on (reason)
+              (
+                sum by (reason) (hl_agent_block_validation_failures_total)
+                unless hl_agent:block_validation_failures:active5m
+              )
+
+  - name: hl-agent-throughput
+    interval: 30s
+    rules:
+      # Detect records emitted activity
+      - record: hl_agent:records_emitted:active5m
+        expr: sum by (topic) (rate(hl_agent_records_emitted_total[5m])) > 0
+
+      # Records emitted rate per topic
+      - record: hl_agent:records_emitted:rate1m
+        expr: sum by (topic) (rate(hl_agent_records_emitted_total[1m]))
+
+      # Idle-safe records emitted rate: prefer live rates, fall back to zero for last-seen topics
+      - record: hl_agent:records_emitted:idle_safe
+        expr: (
+                hl_agent:records_emitted:rate1m
+              )
+              or on (topic)
+              (
+                0 * sum by (topic) (last_over_time(hl_agent_records_emitted_total[30d]))
+              )
+
+      # Detect batches sent activity
+      - record: hl_agent:batches_sent:active5m
+        expr: sum by (status) (rate(hl_agent_batches_sent_total[5m])) > 0
+
+      # Batches sent rate by status
+      - record: hl_agent:batches_sent:rate1m
+        expr: sum by (status) (rate(hl_agent_batches_sent_total[1m]))
+
+      # Idle-safe batches sent rate: prefer live rates, fall back to zero for last-seen statuses
+      - record: hl_agent:batches_sent:idle_safe
+        expr: (
+                hl_agent:batches_sent:rate1m
+              )
+              or on (status)
+              (
+                0 * sum by (status) (last_over_time(hl_agent_batches_sent_total[30d]))
+              )
+
+  - name: hl-agent-sorter
+    interval: 30s
+    rules:
+      # Detect sorter send activity
+      - record: hl_agent:sorter_send_duration_seconds:active5m
+        expr: sum by (status) (increase(hl_agent_sorter_send_duration_seconds_count[5m])) > 0
+
+      # Recent sorter send buckets and long-term fallback for idle periods
+      - record: hl_agent:sorter_send_duration_seconds_bucket:rate5m
+        expr: sum by (le, status) (rate(hl_agent_sorter_send_duration_seconds_bucket[5m]))
+
+      - record: hl_agent:sorter_send_duration_seconds_bucket:last30d
+        expr: sum by (le, status) (last_over_time(hl_agent_sorter_send_duration_seconds_bucket[30d]))
+
+      - record: hl_agent:sorter_send_duration_seconds:p95
+        expr: histogram_quantile(0.95, hl_agent:sorter_send_duration_seconds_bucket:rate5m)
+
+      # Idle-safe p95: prefer live rates, fall back to last buckets when idle
+      - record: hl_agent:sorter_send_duration_seconds:p95:idle_safe
+        expr: (
+                hl_agent:sorter_send_duration_seconds:p95
+                and on (status) hl_agent:sorter_send_duration_seconds:active5m
+              )
+              or on (status)
+              (
+                histogram_quantile(0.95, hl_agent:sorter_send_duration_seconds_bucket:last30d)
+                unless hl_agent:sorter_send_duration_seconds:active5m
+              )
+
+  - name: hl-agent-checkpoint
+    interval: 30s
+    rules:
+      # Detect checkpoint activity
+      - record: hl_agent:checkpoint_duration_seconds:active5m
+        expr: sum by (operation) (increase(hl_agent_checkpoint_duration_seconds_count[5m])) > 0
+
+      # Recent checkpoint buckets and long-term fallback for idle periods
+      - record: hl_agent:checkpoint_duration_seconds_bucket:rate5m
+        expr: sum by (le, operation) (rate(hl_agent_checkpoint_duration_seconds_bucket[5m]))
+
+      - record: hl_agent:checkpoint_duration_seconds_bucket:last30d
+        expr: sum by (le, operation) (last_over_time(hl_agent_checkpoint_duration_seconds_bucket[30d]))
+
+      - record: hl_agent:checkpoint_duration_seconds:p95
+        expr: histogram_quantile(0.95, hl_agent:checkpoint_duration_seconds_bucket:rate5m)
+
+      # Idle-safe p95: prefer live rates, fall back to last buckets when idle
+      - record: hl_agent:checkpoint_duration_seconds:p95:idle_safe
+        expr: (
+                hl_agent:checkpoint_duration_seconds:p95
+                and on (operation) hl_agent:checkpoint_duration_seconds:active5m
+              )
+              or on (operation)
+              (
+                histogram_quantile(0.95, hl_agent:checkpoint_duration_seconds_bucket:last30d)
+                unless hl_agent:checkpoint_duration_seconds:active5m
+              )

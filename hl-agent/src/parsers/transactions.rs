@@ -5,11 +5,14 @@ use crate::parsers::{
     LINE_PREVIEW_LIMIT,
 };
 use crate::sorter_client::proto::DataRecord;
-use anyhow::{Context, Result};
+use anyhow::{bail, Context, Result};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::path::Path;
 use tracing::warn;
+
+/// Maximum buffer size before refusing to accept more data (32 MiB).
+const MAX_BUFFER_SIZE: usize = 32 * 1024 * 1024;
 
 /// Decodes `replica_cmds` lines containing blocks and responses into `hl.transactions` records.
 ///
@@ -70,7 +73,9 @@ struct BundlePayload {
 
 #[derive(Deserialize)]
 struct BundleWithHash(
-    #[serde(deserialize_with = "deserialize_option_string")] Option<String>,
+    #[allow(dead_code)] // retained for schema compatibility even though hashes are dropped
+    #[serde(deserialize_with = "deserialize_option_string")]
+    Option<String>,
     BundlePayload,
 );
 
@@ -134,6 +139,21 @@ impl Parser for TransactionsParser {
             }
         }
 
+        // Check buffer size limit to prevent runaway buffering
+        let new_size = self.buffer.len() + data.len();
+        if new_size > MAX_BUFFER_SIZE {
+            warn!(
+                file_path = %file_path.display(),
+                current_buffer_size = self.buffer.len(),
+                incoming_data_size = data.len(),
+                "TransactionsParser buffer size limit exceeded"
+            );
+            bail!(
+                "TransactionsParser buffer exceeded {} bytes",
+                MAX_BUFFER_SIZE
+            );
+        }
+
         self.buffer.extend_from_slice(data);
         let lines = drain_complete_lines(&mut self.buffer);
         let mut records = Vec::new();
@@ -181,6 +201,10 @@ impl Parser for TransactionsParser {
     fn get_line_count(&self) -> u64 {
         self.line_count
     }
+
+    fn parser_type(&self) -> &'static str {
+        "transactions"
+    }
 }
 
 impl TransactionsParser {
@@ -211,10 +235,10 @@ impl TransactionsParser {
             .as_deref()
             .and_then(parse_iso8601_to_millis)
             .unwrap_or(0);
-        let actions_with_hashes = flatten_actions_with_hashes(signed_action_bundles);
+        let actions = flatten_actions(signed_action_bundles);
         let responses = flatten_responses(resps);
 
-        let action_count = actions_with_hashes.len();
+        let action_count = actions.len();
         let response_count = responses.len();
         if action_count != response_count {
             warn!(
@@ -226,14 +250,13 @@ impl TransactionsParser {
         }
 
         let mut responses_iter = responses.into_iter();
-        for (_bundle_hash, signed_action) in actions_with_hashes.into_iter() {
+        for signed_action in actions {
             let response = responses_iter.next().unwrap_or_else(|| ActionResponse {
                 user: None,
                 res: ResponseResult::default(),
             });
-            // Note: signed_action_bundles[i].0 contains a bundle hash, but it's non-unique
-            // (multiple transactions in the same bundle share the same hash).
-            // We leave hash empty since unique transaction hashes are not available from this source.
+            // Bundle hashes are discarded because they're non-unique across transactions within
+            // the same bundle; emitting them would mislead downstream consumers.
             let ActionResponse { user, res } = response;
             let tx = TransactionRecord {
                 time: timestamp,
@@ -250,24 +273,28 @@ impl TransactionsParser {
     }
 }
 
-fn flatten_actions_with_hashes(bundles: Vec<BundleWithHash>) -> Vec<(String, SignedAction)> {
-    let mut actions_with_hashes = Vec::new();
-    for BundleWithHash(hash, bundle) in bundles {
-        let hash_value = hash.unwrap_or_default();
-        for action in bundle.signed_actions {
-            actions_with_hashes.push((hash_value.clone(), action));
-        }
+fn flatten_actions(mut bundles: Vec<BundleWithHash>) -> Vec<SignedAction> {
+    let capacity = bundles
+        .iter()
+        .map(|bundle| bundle.1.signed_actions.len())
+        .sum();
+    let mut actions = Vec::with_capacity(capacity);
+    for BundleWithHash(_, bundle) in bundles.drain(..) {
+        actions.extend(bundle.signed_actions);
     }
-    actions_with_hashes
+    actions
 }
 
 fn flatten_responses(resps: Option<Resps>) -> Vec<ActionResponse> {
-    let mut responses = Vec::new();
-    if let Some(resps) = resps {
-        for ResponseBundle(hash, bundle_responses) in resps.full {
-            let _ = hash;
-            responses.extend(bundle_responses);
-        }
+    let Some(resps) = resps else {
+        return Vec::new();
+    };
+
+    let capacity = resps.full.iter().map(|bundle| bundle.1.len()).sum();
+    let mut responses = Vec::with_capacity(capacity);
+    for ResponseBundle(hash, bundle_responses) in resps.full {
+        let _ = hash;
+        responses.extend(bundle_responses);
     }
     responses
 }

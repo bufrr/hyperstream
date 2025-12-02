@@ -1,3 +1,4 @@
+use crate::metrics::LATEST_BLOCK_HEIGHT;
 use crate::parsers::block_merger::{BlockMerger, ReplicaBlockData};
 use crate::parsers::utils::extract_starting_block;
 use crate::parsers::{
@@ -5,12 +6,15 @@ use crate::parsers::{
     LINE_PREVIEW_LIMIT,
 };
 use crate::sorter_client::proto::DataRecord;
-use anyhow::Result;
+use anyhow::{bail, Result};
 use dashmap::DashMap;
 use serde::Deserialize;
 use std::path::Path;
 use std::sync::{Arc, OnceLock};
 use tracing::warn;
+
+/// Maximum buffer size before refusing to accept more data (32 MiB).
+const MAX_BUFFER_SIZE: usize = 32 * 1024 * 1024;
 
 pub(crate) type SharedProposerCache = Arc<DashMap<u64, String>>;
 
@@ -86,6 +90,18 @@ impl crate::parsers::Parser for BlocksParser {
             }
         }
 
+        // Check buffer size limit to avoid unbounded allocations
+        let new_size = self.buffer.len() + data.len();
+        if new_size > MAX_BUFFER_SIZE {
+            warn!(
+                file_path = %file_path.display(),
+                current_buffer_size = self.buffer.len(),
+                incoming_data_size = data.len(),
+                "BlocksParser buffer size limit exceeded"
+            );
+            bail!("BlocksParser buffer exceeded {} bytes", MAX_BUFFER_SIZE);
+        }
+
         self.buffer.extend_from_slice(data);
         if self.buffer.is_empty() {
             return Ok(Vec::new());
@@ -121,10 +137,15 @@ impl crate::parsers::Parser for BlocksParser {
                         if let Some(replica_data) = self.abci_block_to_replica_data(block, height) {
                             // Process block - looks up hash from cache, validates, and returns merged block
                             // Returns None if Redis data exists but validation fails
-                            if let Some(merged) = self.merger.process_file_block_blocking(replica_data)
+                            if let Some(merged) =
+                                self.merger.process_file_block_blocking(replica_data)
                             {
                                 match merged.to_data_record() {
-                                    Ok(data_record) => records.push(data_record),
+                                    Ok(data_record) => {
+                                        // Update latest block height gauge metric
+                                        LATEST_BLOCK_HEIGHT.set(height as i64);
+                                        records.push(data_record);
+                                    }
                                     Err(err) => {
                                         warn!(
                                             error = %err,
@@ -162,6 +183,10 @@ impl crate::parsers::Parser for BlocksParser {
 
     fn get_line_count(&self) -> u64 {
         self.line_count
+    }
+
+    fn parser_type(&self) -> &'static str {
+        "blocks"
     }
 }
 

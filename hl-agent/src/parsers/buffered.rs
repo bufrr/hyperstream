@@ -6,8 +6,13 @@
 
 use crate::parsers::{drain_complete_lines, trim_line_bytes, Parser};
 use crate::sorter_client::proto::DataRecord;
-use anyhow::Result;
+use anyhow::{bail, Result};
 use std::path::Path;
+use tracing::warn;
+
+/// Maximum buffer size before refusing to accept more data (32 MiB).
+/// Prevents OOM from malformed files with no newlines.
+const MAX_BUFFER_SIZE: usize = 32 * 1024 * 1024;
 
 /// Trait for parsers that process complete lines.
 ///
@@ -19,6 +24,11 @@ pub trait LineParser: Send {
     /// The line has already been trimmed of trailing whitespace.
     /// Return an empty Vec if the line produces no records (e.g., empty lines).
     fn parse_line(&mut self, file_path: &Path, line: &[u8]) -> Result<Vec<DataRecord>>;
+
+    /// Name reported to metrics for this parser implementation.
+    fn parser_type(&self) -> &'static str {
+        std::any::type_name::<Self>()
+    }
 }
 
 /// Wrapper that adds line buffering to any `LineParser`.
@@ -52,6 +62,25 @@ impl<P: LineParser> BufferedLineParser<P> {
 
 impl<P: LineParser> Parser for BufferedLineParser<P> {
     fn parse(&mut self, file_path: &Path, data: &[u8]) -> Result<Vec<DataRecord>> {
+        // Enforce buffer size limit before extending
+        let new_size = self.buffer.len() + data.len();
+        if new_size > MAX_BUFFER_SIZE {
+            warn!(
+                file_path = %file_path.display(),
+                current_buffer_size = self.buffer.len(),
+                incoming_data_size = data.len(),
+                max_buffer_size = MAX_BUFFER_SIZE,
+                "Buffer size limit exceeded - likely malformed file with no newlines"
+            );
+            bail!(
+                "Parser buffer exceeded {} bytes (current: {}, incoming: {}). \
+                 File likely has no newlines or extremely long lines.",
+                MAX_BUFFER_SIZE,
+                self.buffer.len(),
+                data.len()
+            );
+        }
+
         self.buffer.extend_from_slice(data);
         let lines = drain_complete_lines(&mut self.buffer);
         let mut all_records = Vec::new();
@@ -71,6 +100,10 @@ impl<P: LineParser> Parser for BufferedLineParser<P> {
 
     fn backlog_len(&self) -> usize {
         self.buffer.len()
+    }
+
+    fn parser_type(&self) -> &'static str {
+        self.inner.parser_type()
     }
 }
 

@@ -64,6 +64,10 @@ impl LineParser for MiscEventsLineParser {
             }
         }
     }
+
+    fn parser_type(&self) -> &'static str {
+        "misc_events"
+    }
 }
 
 fn node_misc_event_to_record(event: RawMiscEvent, block_height: Option<u64>) -> Result<DataRecord> {

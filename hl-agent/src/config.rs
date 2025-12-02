@@ -12,6 +12,7 @@ const DEFAULT_POLL_INTERVAL_MS: u64 = 100;
 const DEFAULT_BATCH_SIZE: usize = 100;
 const DEFAULT_SKIP_HISTORICAL: bool = true;
 const DEFAULT_TAIL_BYTES: u64 = 0;
+const DEFAULT_INACTIVE_TIMEOUT_SEC: u64 = 300; // 5 minutes
 const DEFAULT_MAX_CONCURRENT_TAILERS: usize = 64;
 const DEFAULT_BULK_LOAD_WARN_BYTES: u64 = 500 * 1024 * 1024; // 500 MiB
 const DEFAULT_BULK_LOAD_ABORT_BYTES: u64 = 1024 * 1024 * 1024; // 1 GiB
@@ -52,6 +53,9 @@ pub struct WatcherConfig {
     /// When skip_historical=true, read the last N bytes of each existing file (DEFAULT: 0)
     #[serde(default = "default_tail_bytes")]
     pub tail_bytes: u64,
+    /// Timeout in seconds after which inactive files (no growth) will have their tailers stopped (DEFAULT: 300)
+    #[serde(default = "default_inactive_timeout_sec")]
+    pub inactive_timeout_sec: u64,
 }
 
 impl Default for WatcherConfig {
@@ -61,6 +65,7 @@ impl Default for WatcherConfig {
             poll_interval_ms: DEFAULT_POLL_INTERVAL_MS,
             skip_historical: DEFAULT_SKIP_HISTORICAL,
             tail_bytes: DEFAULT_TAIL_BYTES,
+            inactive_timeout_sec: default_inactive_timeout_sec(),
         }
     }
 }
@@ -130,6 +135,9 @@ fn default_skip_historical() -> bool {
 }
 fn default_tail_bytes() -> u64 {
     DEFAULT_TAIL_BYTES
+}
+fn default_inactive_timeout_sec() -> u64 {
+    DEFAULT_INACTIVE_TIMEOUT_SEC
 }
 fn default_max_concurrent_tailers() -> usize {
     DEFAULT_MAX_CONCURRENT_TAILERS

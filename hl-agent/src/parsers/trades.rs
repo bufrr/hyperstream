@@ -57,6 +57,10 @@ impl Parser for TradesParser {
         // Account for buffered bytes and pending fills so checkpoints remain safe
         self.inner.backlog_len() + self.inner.inner().pending_backlog_len()
     }
+
+    fn parser_type(&self) -> &'static str {
+        "trades"
+    }
 }
 
 impl Default for TradesParser {

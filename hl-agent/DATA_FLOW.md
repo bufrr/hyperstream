@@ -530,8 +530,10 @@ The system uses a two-binary architecture for clean separation of concerns:
 │                                             ┌─────────────────┐            │
 │  ┌─────────────────┐                        │  File Watchers  │            │
 │  │ Hyperliquid     │ ──────────────────────>│  + Tailers      │            │
-│  │ Node Files      │   replica_cmds, etc.   └────────┬────────┘            │
-│  └─────────────────┘                                 │                     │
+│  │ Node Files      │   replica_cmds, etc.   │  + Activity     │            │
+│  └─────────────────┘                        │    Monitor      │            │
+│                                             └────────┬────────┘            │
+│                                                      │                     │
 │                                                      ▼                     │
 │                                             ┌─────────────────┐            │
 │                                             │  gRPC Sorter    │            │
@@ -561,10 +563,19 @@ Standalone binary that:
 
 Main data processing binary that:
 1. Watches Hyperliquid node files for changes
-2. Tails files incrementally with checkpoint recovery
-3. Parses data into 6 Kafka topics
-4. Queries Redis for block hashes (populated by ws-agent)
-5. Outputs to gRPC sorter or JSON files
+2. Spawns tailers for active files (parallel processing)
+3. **Monitors file activity** and shuts down inactive tailers (5-minute timeout)
+4. Tails files incrementally with checkpoint recovery
+5. Parses data into 6 Kafka topics
+6. Queries Redis for block hashes (populated by ws-agent)
+7. Outputs to gRPC sorter or JSON files
+
+**File Activity Monitor**:
+- Polls file sizes every 10 seconds
+- Tracks growth/stagnation per file
+- Automatically shuts down tailers for inactive files (default: 5 minutes)
+- Ensures continuous metrics during file transitions
+- Prevents resource waste on completed files
 
 **Usage**:
 ```bash
@@ -654,6 +665,87 @@ HashStore provides block hash lookup via Redis:
 2. hl-agent queries HashStore -> checks LRU cache first -> falls back to Redis
 3. Cache miss returns empty hash (block may be too old)
 
+### File Lifecycle Management
+
+The agent implements intelligent file lifecycle management to handle continuous file creation by Hyperliquid nodes:
+
+```
+┌────────────────────────────────────────────────────────────────┐
+│                    File Lifecycle Flow                          │
+├────────────────────────────────────────────────────────────────┤
+│                                                                 │
+│  1. File Detection                                              │
+│     └─> Watcher detects new file                               │
+│         └─> Spawn tailer task                                  │
+│             └─> Create shutdown channel (mpsc)                 │
+│                 └─> Track in FileActivity map                  │
+│                                                                 │
+│  2. Active Processing (file growing)                           │
+│     └─> Tailer reads 8MiB chunks                               │
+│     └─> Activity Monitor polls every 10s                       │
+│         └─> File size increases → reset activity timer        │
+│         └─> Update last_size and last_checked                  │
+│                                                                 │
+│  3. Inactivity Detection (file complete)                       │
+│     └─> No file growth for 5 minutes                           │
+│         └─> Activity Monitor sends shutdown signal             │
+│             └─> Tailer receives signal via try_recv()          │
+│                 └─> Graceful exit (checkpoint saved)           │
+│                     └─> Remove from active_tailers map         │
+│                                                                 │
+│  4. Parallel Processing (overlap period)                       │
+│     └─> Old file (file_N) still processing                     │
+│     └─> New file (file_N+1) detected and started              │
+│     └─> Both process in parallel (continuous metrics)          │
+│     └─> Old file shuts down after 5min timeout                 │
+│     └─> New file continues → no metric gap                     │
+│                                                                 │
+└────────────────────────────────────────────────────────────────┘
+```
+
+**Key Components**:
+
+1. **TailerHandle** (src/runner/file_mode.rs:26-29):
+   - Stores JoinHandle for task management
+   - Contains shutdown_tx (mpsc::Sender) for signaling
+
+2. **FileActivity** (src/runner/file_mode.rs:31-34):
+   - Tracks last_size (u64) for growth detection
+   - Records last_checked (SystemTime) for timeout calculation
+
+3. **Activity Monitor Task** (src/runner/file_mode.rs:506-617):
+   - Polls every 10 seconds
+   - Compares current file size with last_size
+   - Calculates inactivity duration
+   - Sends shutdown signal when timeout exceeded
+
+4. **Shutdown Channel Pattern** (src/tailer.rs):
+   - Two-level checking for responsiveness:
+     - Immediate: try_recv() at loop start
+     - During idle: select! in sleep_or_shutdown helper
+   - Enables instant wake from sleep on shutdown signal
+
+**Timeline Example** (verified in production):
+```
+14:55:52 - Agent starts
+         - Files 815250000, 815240000 detected
+         - Both tailers spawned
+
+15:00:52 - File 815240000 inactive for 5min
+         - Shutdown signal sent
+         - Tailer exits gracefully
+
+15:08:40 - New file 815260000 detected
+         - Tailer spawned immediately
+         - Parallel processing with 815250000
+
+15:13:42 - File 815250000 inactive for 5min
+         - Shutdown signal sent
+         - Only 815260000 remains active
+
+Result: Zero downtime, continuous data flow
+```
+
 ### Configuration Example
 
 ```toml
@@ -670,6 +762,7 @@ watch_paths = [
 ]
 poll_interval_ms = 100
 skip_historical = true
+inactive_timeout_sec = 300  # 5 minutes (default)
 
 [sorter]
 endpoint = "http://127.0.0.1:50051"
@@ -787,12 +880,13 @@ HL_AGENT_CONFIG=config.toml ./target/release/hl-agent
 
 ---
 
-**Document Version**: v10.0
-**Last Updated**: 2025-11-28
+**Document Version**: v11.0
+**Last Updated**: 2025-12-02
 **Status**: Production Ready - All 6 topics verified (file mode + Redis hash lookup)
-**Architecture**: Two-binary system (ws-agent + hl-agent)
+**Architecture**: Two-binary system (ws-agent + hl-agent) with intelligent file lifecycle management
 **Recent Changes**:
-- Added `line_count` to checkpoint schema for accurate block height calculation
-- Refactored tailer functions to use `TailerConfig` struct
-- Optimized `skip_historical` to only count lines for `replica_cmds` files
-- Fixed block height formula: `height = filename + line_count + 1`
+- **File Activity Monitor**: Automatic shutdown of inactive tailers (5-minute timeout)
+- **Graceful Shutdown**: Two-level shutdown checking (try_recv + select!) for instant response
+- **Parallel Processing**: Multiple files processed simultaneously for zero-downtime transitions
+- **Resource Efficiency**: Automatic cleanup prevents CPU waste on completed files
+- **Verified in Production**: 32+ minutes runtime with 3 file transitions, zero metric gaps

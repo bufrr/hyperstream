@@ -1,5 +1,6 @@
 pub mod checkpoint;
 pub mod config;
+pub mod metrics;
 pub mod output_writer;
 pub mod parsers;
 pub mod runner;

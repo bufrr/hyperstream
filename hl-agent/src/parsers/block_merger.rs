@@ -2,9 +2,10 @@
 
 use super::hash_store::HashStore;
 use super::schemas::Block;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, OnceLock};
+use std::time::Duration;
 use tokio::runtime::{Builder, Handle};
 use tokio::task;
 use tracing::{info, warn};
@@ -39,6 +40,46 @@ pub struct ReplicaBlockData {
     pub round: u64,
 }
 
+/// Block data returned by the Hyperliquid Explorer API.
+#[derive(Clone, Debug)]
+struct ExplorerBlockData {
+    hash: String,
+    block_time: u64,
+    proposer: String,
+}
+
+#[derive(Deserialize)]
+struct ExplorerBlockDetails {
+    hash: String,
+    #[serde(rename = "blockTime")]
+    block_time: u64,
+    proposer: String,
+}
+
+#[derive(Deserialize)]
+struct ExplorerBlockResponse {
+    #[serde(rename = "blockDetails")]
+    block_details: Option<ExplorerBlockDetails>,
+}
+
+static EXPLORER_CLIENT: OnceLock<reqwest::Client> = OnceLock::new();
+
+fn get_or_build_client() -> Result<&'static reqwest::Client, String> {
+    if let Some(client) = EXPLORER_CLIENT.get() {
+        return Ok(client);
+    }
+
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(5))
+        .build()
+        .map_err(|err| format!("failed to build explorer client: {err}"))?;
+
+    let _ = EXPLORER_CLIENT.set(client);
+    EXPLORER_CLIENT
+        .get()
+        .ok_or_else(|| "failed to initialize explorer client".to_string())
+}
+
 #[derive(Default)]
 struct MergerStats {
     hash_hits: AtomicU64,
@@ -54,6 +95,94 @@ pub struct BlockMerger {
 }
 
 static GLOBAL_BLOCK_MERGER: OnceLock<Arc<BlockMerger>> = OnceLock::new();
+
+/// Single attempt to fetch block from Explorer API
+async fn fetch_block_from_explorer_once(height: u64) -> Result<ExplorerBlockData, String> {
+    if cfg!(test) {
+        return Err("Explorer API fallback disabled in tests".to_string());
+    }
+
+    let client = get_or_build_client()?;
+
+    let response = client
+        .post("https://rpc.hyperliquid.xyz/explorer")
+        .json(&serde_json::json!({
+            "height": height,
+            "type": "blockDetails",
+        }))
+        .send()
+        .await
+        .map_err(|err| format!("Explorer API request error: {err}"))?;
+
+    let status = response.status();
+    if !status.is_success() {
+        return Err(format!("Explorer API returned HTTP {status}"));
+    }
+
+    let payload: ExplorerBlockResponse = response
+        .json()
+        .await
+        .map_err(|err| format!("failed to parse Explorer API response: {err}"))?;
+
+    let details = payload
+        .block_details
+        .ok_or_else(|| "Explorer API response missing blockDetails".to_string())?;
+
+    Ok(ExplorerBlockData {
+        hash: details.hash,
+        block_time: details.block_time,
+        proposer: details.proposer,
+    })
+}
+
+/// Fetch block from Explorer API with 3 retry attempts and exponential backoff
+async fn fetch_block_from_explorer(height: u64) -> Result<ExplorerBlockData, String> {
+    const MAX_RETRIES: u32 = 3;
+    const BASE_DELAY_MS: u64 = 500; // Start with 500ms
+
+    let mut last_error = String::new();
+
+    for attempt in 1..=MAX_RETRIES {
+        match fetch_block_from_explorer_once(height).await {
+            Ok(data) => {
+                if attempt > 1 {
+                    info!(
+                        height = height,
+                        attempt = attempt,
+                        "Explorer API succeeded after retry"
+                    );
+                }
+                return Ok(data);
+            }
+            Err(err) => {
+                last_error = err.clone();
+
+                if attempt < MAX_RETRIES {
+                    // Exponential backoff: 500ms, 1000ms, 2000ms
+                    let delay_ms = BASE_DELAY_MS * (1 << (attempt - 1));
+                    warn!(
+                        height = height,
+                        attempt = attempt,
+                        max_retries = MAX_RETRIES,
+                        retry_after_ms = delay_ms,
+                        error = %err,
+                        "Explorer API attempt failed; will retry"
+                    );
+                    tokio::time::sleep(Duration::from_millis(delay_ms)).await;
+                } else {
+                    warn!(
+                        height = height,
+                        attempts = MAX_RETRIES,
+                        error = %err,
+                        "Explorer API failed after all retry attempts"
+                    );
+                }
+            }
+        }
+    }
+
+    Err(last_error)
+}
 
 impl Default for BlockMerger {
     fn default() -> Self {
@@ -102,12 +231,30 @@ impl BlockMerger {
 
                 if block_time_match && proposer_match {
                     self.stats.hash_hits.fetch_add(1, Ordering::Relaxed);
+                    crate::metrics::REDIS_CACHE_TOTAL
+                        .with_label_values(&["hit"])
+                        .inc();
                     Some(MergedBlock::from_replica_data(data, Some(redis_data.hash)))
                 } else {
                     self.stats.hash_misses.fetch_add(1, Ordering::Relaxed);
                     self.stats
                         .validation_failures
                         .fetch_add(1, Ordering::Relaxed);
+
+                    // Record validation failure reason
+                    let reason = match (!block_time_match, !proposer_match) {
+                        (true, true) => "both_mismatch",
+                        (true, false) => "block_time_mismatch",
+                        (false, true) => "proposer_mismatch",
+                        _ => "unknown",
+                    };
+                    crate::metrics::BLOCK_VALIDATION_FAILURES_TOTAL
+                        .with_label_values(&[reason])
+                        .inc();
+                    crate::metrics::REDIS_CACHE_TOTAL
+                        .with_label_values(&["miss"])
+                        .inc();
+
                     warn!(
                         height = data.height,
                         expected_block_time = data.block_time,
@@ -116,13 +263,83 @@ impl BlockMerger {
                         actual_proposer = %redis_data.proposer,
                         "Redis block data validation failed; dropping block"
                     );
-                    None // Don't push block if validation fails
+                    None
                 }
             }
             None => {
-                // No Redis data - emit block without hash
+                // No Redis data - try Explorer API fallback before emitting without hash
                 self.stats.hash_misses.fetch_add(1, Ordering::Relaxed);
-                Some(MergedBlock::from_replica_data(data, None))
+                crate::metrics::REDIS_CACHE_TOTAL
+                    .with_label_values(&["miss"])
+                    .inc();
+                warn!(
+                    height = data.height,
+                    "No Redis data for block; trying Explorer API fallback (will emit without hash on failure)"
+                );
+
+                match fetch_block_from_explorer(data.height).await {
+                    Ok(explorer_data) => {
+                        let block_time_match = explorer_data.block_time == data.block_time;
+                        let proposer_match =
+                            explorer_data.proposer.to_lowercase() == data.proposer.to_lowercase();
+
+                        if block_time_match && proposer_match {
+                            crate::metrics::EXPLORER_API_FALLBACK_TOTAL
+                                .with_label_values(&["success"])
+                                .inc();
+                            Some(MergedBlock::from_replica_data(
+                                data,
+                                Some(explorer_data.hash),
+                            ))
+                        } else {
+                            self.stats
+                                .validation_failures
+                                .fetch_add(1, Ordering::Relaxed);
+
+                            // Record validation failure reason
+                            let reason = match (!block_time_match, !proposer_match) {
+                                (true, true) => "both_mismatch",
+                                (true, false) => "block_time_mismatch",
+                                (false, true) => "proposer_mismatch",
+                                _ => "unknown",
+                            };
+                            crate::metrics::BLOCK_VALIDATION_FAILURES_TOTAL
+                                .with_label_values(&[reason])
+                                .inc();
+                            crate::metrics::EXPLORER_API_FALLBACK_TOTAL
+                                .with_label_values(&["validation_failed"])
+                                .inc();
+
+                            warn!(
+                                height = data.height,
+                                expected_block_time = data.block_time,
+                                actual_block_time = explorer_data.block_time,
+                                expected_proposer = %data.proposer,
+                                actual_proposer = %explorer_data.proposer,
+                                "Explorer block data validation failed; dropping block"
+                            );
+                            None
+                        }
+                    }
+                    Err(err) => {
+                        self.stats
+                            .validation_failures
+                            .fetch_add(1, Ordering::Relaxed);
+                        crate::metrics::BLOCK_VALIDATION_FAILURES_TOTAL
+                            .with_label_values(&["no_redis_data"])
+                            .inc();
+                        crate::metrics::EXPLORER_API_FALLBACK_TOTAL
+                            .with_label_values(&["api_error"])
+                            .inc();
+
+                        warn!(
+                            height = data.height,
+                            error = %err,
+                            "No Redis data for block; Explorer API fallback failed; emitting without hash (validation failure counted)"
+                        );
+                        Some(MergedBlock::from_replica_data(data, None))
+                    }
+                }
             }
         }
     }
@@ -209,7 +426,10 @@ mod tests {
         store.cache_insert_for_test(100, redis_data(block.block_time, "PROPOSER", "0xabc123"));
         let merger = BlockMerger::with_store(store);
 
-        let merged = merger.process_file_block(block).await.expect("block should be emitted");
+        let merged = merger
+            .process_file_block(block)
+            .await
+            .expect("block should be emitted");
         assert_eq!(merged.hash, "0xabc123");
     }
 
@@ -219,7 +439,10 @@ mod tests {
         let merger = BlockMerger::with_store(store);
 
         // No Redis data - block should still be emitted without hash
-        let merged = merger.process_file_block(sample_block(200)).await.expect("block should be emitted");
+        let merged = merger
+            .process_file_block(sample_block(200))
+            .await
+            .expect("block should be emitted");
         assert_eq!(merged.hash, "");
     }
 
@@ -233,7 +456,9 @@ mod tests {
         );
         let merger = BlockMerger::with_store(store);
 
-        let merged = merger.process_file_block_blocking(block).expect("block should be emitted");
+        let merged = merger
+            .process_file_block_blocking(block)
+            .expect("block should be emitted");
         assert_eq!(merged.hash, "0xdeadbeef");
     }
 
@@ -246,7 +471,10 @@ mod tests {
 
         // Block should NOT be emitted due to validation failure
         let merged = merger.process_file_block(sample_block(400)).await;
-        assert!(merged.is_none(), "block should be dropped on validation failure");
+        assert!(
+            merged.is_none(),
+            "block should be dropped on validation failure"
+        );
         assert_eq!(merger.stats.validation_failures.load(Ordering::Relaxed), 1);
     }
 }

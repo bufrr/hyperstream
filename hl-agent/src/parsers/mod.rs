@@ -69,6 +69,14 @@ pub trait Parser: Send {
     fn get_line_count(&self) -> u64 {
         0
     }
+
+    /// Name reported to metrics for this parser implementation.
+    ///
+    /// Defaults to the concrete type name so histograms can be split per parser without relying on
+    /// file-path heuristics.
+    fn parser_type(&self) -> &'static str {
+        std::any::type_name::<Self>()
+    }
 }
 
 /// Routes a file path to the appropriate parser(s).

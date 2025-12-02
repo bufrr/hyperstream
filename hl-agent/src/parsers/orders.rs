@@ -27,8 +27,8 @@ struct OrderStatusRecord {
     hash: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     builder: Option<Value>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    time: Option<String>,
+    /// Time in milliseconds (converted from ISO8601 for Allium compatibility)
+    time: u64,
     #[serde(skip_serializing_if = "Option::is_none")]
     status: Option<Value>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -97,6 +97,10 @@ impl LineParser for OrdersLineParser {
 
         Ok(records)
     }
+
+    fn parser_type(&self) -> &'static str {
+        "orders"
+    }
 }
 
 impl Default for BufferedLineParser<OrdersLineParser> {
@@ -122,11 +126,18 @@ fn order_status_to_record(
     let tx_hash = hash.as_deref().and_then(normalize_tx_hash);
     let flattened_order = extract_order_fields(&status);
 
+    // Convert ISO8601 time to milliseconds for Allium compatibility
+    let timestamp = time
+        .as_deref()
+        .and_then(parse_iso8601_to_millis)
+        .or_else(|| block_time.and_then(parse_iso8601_to_millis))
+        .unwrap_or(0);
+
     let order_record = OrderStatusRecord {
         user: user.clone(),
         hash: hash.clone(),
         builder,
-        time: time.clone(),
+        time: timestamp,  // Now using milliseconds instead of ISO8601 string
         status: Some(status.clone()),
         coin: flattened_order.coin.clone(),
         side: flattened_order.side.clone(),
@@ -137,12 +148,6 @@ fn order_status_to_record(
 
     let payload =
         serde_json::to_vec(&order_record).context("failed to encode order payload to JSON")?;
-
-    let timestamp = time
-        .as_deref()
-        .and_then(parse_iso8601_to_millis)
-        .or_else(|| block_time.and_then(parse_iso8601_to_millis))
-        .unwrap_or(0);
 
     Ok(DataRecord {
         block_height,
