@@ -9,6 +9,7 @@ use crate::sorter_client::proto::DataRecord;
 use anyhow::{bail, Result};
 use dashmap::DashMap;
 use serde::Deserialize;
+use sonic_rs::Value;
 use std::path::Path;
 use std::sync::{Arc, OnceLock};
 use tracing::warn;
@@ -74,7 +75,7 @@ struct ReplicaAbciBlock {
     #[serde(default)]
     time: String,
     #[serde(default)]
-    signed_action_bundles: Vec<serde_json::Value>, // We only need the count
+    signed_action_bundles: Vec<Value>, // We only need the count
 }
 
 impl crate::parsers::Parser for BlocksParser {
@@ -122,7 +123,7 @@ impl crate::parsers::Parser for BlocksParser {
             // e.g., file "810800000" contains blocks 810800001 to 810810000
             let calculated_height = self.starting_block.map(|start| start + self.line_count + 1);
 
-            match serde_json::from_slice::<ReplicaCmd>(&line) {
+            match sonic_rs::from_slice::<ReplicaCmd>(&line) {
                 Ok(cmd) => {
                     if let Some(block) = cmd.abci_block {
                         // Use calculated height, fall back to round if filename parsing failed

@@ -5,7 +5,7 @@ use futures_util::{SinkExt, StreamExt};
 use redis::aio::ConnectionManager;
 use redis::AsyncCommands;
 use serde::{Deserialize, Serialize};
-use serde_json::{json, Value};
+use sonic_rs::{json, Value};
 use tokio::time::sleep;
 use tokio_tungstenite::{connect_async, tungstenite::Message};
 use tracing::{debug, error, info, warn};
@@ -122,7 +122,7 @@ async fn stream_once(ws_url: &str, redis_conn: &mut ConnectionManager) -> Result
     let (mut write, mut read) = ws_stream.split();
 
     let sub = SubscriptionMessage::new(ExplorerSubscription::ExplorerBlock);
-    let sub_msg = serde_json::to_string(&sub).context("Failed to serialize subscription")?;
+    let sub_msg = sonic_rs::to_string(&sub).context("Failed to serialize subscription")?;
     write
         .send(Message::Text(sub_msg.into()))
         .await
@@ -164,14 +164,14 @@ async fn stream_once(ws_url: &str, redis_conn: &mut ConnectionManager) -> Result
 }
 
 async fn handle_text(text: &str, redis_conn: &mut ConnectionManager) -> Result<()> {
-    if let Ok(resp) = serde_json::from_str::<SubscriptionResponse>(text) {
+    if let Ok(resp) = sonic_rs::from_str::<SubscriptionResponse>(text) {
         if resp.channel == "subscriptionResponse" {
             debug!("Subscription acknowledged: {:?}", resp.data);
             return Ok(());
         }
     }
 
-    if let Ok(blocks) = serde_json::from_str::<Vec<ExplorerBlock>>(text) {
+    if let Ok(blocks) = sonic_rs::from_str::<Vec<ExplorerBlock>>(text) {
         for block in blocks {
             store_block(redis_conn, &block).await?;
         }
@@ -192,8 +192,9 @@ async fn store_block(conn: &mut ConnectionManager, block: &ExplorerBlock) -> Res
         "proposer": block.proposer,
         "blockTime": block.block_time,
         "numTxs": block.num_txs,
-    })
-    .to_string();
+    });
+
+    let payload = sonic_rs::to_string(&payload)?;
 
     conn.set_ex::<_, _, ()>(&key, payload, BLOCK_TTL_SECONDS)
         .await

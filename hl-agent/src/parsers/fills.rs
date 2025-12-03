@@ -6,7 +6,7 @@ use crate::parsers::{
 use crate::sorter_client::proto::DataRecord;
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
-use serde_json::Value;
+use sonic_rs::Value;
 use std::fmt;
 use std::path::Path;
 use tracing::warn;
@@ -116,8 +116,8 @@ pub(crate) enum FillLine {
 
 #[derive(Debug)]
 pub(crate) struct FillLineParseError {
-    batch_err: serde_json::Error,
-    single_err: serde_json::Error,
+    batch_err: sonic_rs::Error,
+    single_err: sonic_rs::Error,
 }
 
 impl fmt::Display for FillLineParseError {
@@ -131,9 +131,9 @@ impl fmt::Display for FillLineParseError {
 }
 
 pub(crate) fn parse_fill_line(line: &[u8]) -> Result<FillLine, FillLineParseError> {
-    match serde_json::from_slice::<FillBatchEnvelope<NodeFill>>(line) {
+    match sonic_rs::from_slice::<FillBatchEnvelope<NodeFill>>(line) {
         Ok(batch) => Ok(FillLine::Batch(batch)),
-        Err(batch_err) => match serde_json::from_slice::<NodeFill>(line) {
+        Err(batch_err) => match sonic_rs::from_slice::<NodeFill>(line) {
             Ok(fill) => Ok(FillLine::Single(Box::new(fill))),
             Err(single_err) => Err(FillLineParseError {
                 batch_err,
@@ -248,8 +248,7 @@ fn node_fill_to_record(node_fill: NodeFill) -> Result<DataRecord> {
     // Serialize as tuple: [user, fillDetails]
     // Allium format: ["0x...", {coin: "ETH", px: "100", ...}]
     let fill_tuple = (user, fill_details);
-    let payload =
-        serde_json::to_vec(&fill_tuple).context("failed to encode fill payload to JSON")?;
+    let payload = sonic_rs::to_vec(&fill_tuple).context("failed to encode fill payload to JSON")?;
 
     Ok(DataRecord {
         block_height,

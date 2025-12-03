@@ -22,6 +22,24 @@ lazy_static! {
     )
     .unwrap();
 
+    /// End-to-end latency from file read through record emission by parser type (seconds)
+    pub static ref END_TO_END_LATENCY: HistogramVec = register_histogram_vec!(
+        "hl_agent_end_to_end_latency_seconds",
+        "Total latency from file read through record emission by parser type",
+        &["parser_type"],
+        vec![0.001, 0.005, 0.01, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0]
+    )
+    .unwrap();
+
+    /// Block merger lookup/fallback duration (seconds)
+    pub static ref BLOCK_MERGER_DURATION: HistogramVec = register_histogram_vec!(
+        "hl_agent_block_merger_duration_seconds",
+        "Time spent merging block hashes (lookup + fallback paths)",
+        &["stage"],
+        vec![0.00005, 0.0001, 0.0005, 0.001, 0.005, 0.01, 0.05, 0.1, 0.5, 1.0]
+    )
+    .unwrap();
+
     /// Checkpoint write duration (seconds)
     pub static ref CHECKPOINT_DURATION: HistogramVec = register_histogram_vec!(
         "hl_agent_checkpoint_duration_seconds",

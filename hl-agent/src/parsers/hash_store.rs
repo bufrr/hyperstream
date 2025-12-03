@@ -3,7 +3,7 @@ use lru::LruCache;
 use parking_lot::RwLock;
 use redis::aio::ConnectionManager;
 use redis::AsyncCommands;
-use serde_json::Value;
+use sonic_rs::{JsonContainerTrait, JsonValueTrait, Value};
 use std::num::NonZeroUsize;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, OnceLock};
@@ -28,6 +28,29 @@ pub struct RedisBlockData {
     pub block_time: u64,
     pub proposer: String,
     pub hash: String,
+}
+
+/// Outcome of a block data lookup.
+pub enum BlockLookupResult {
+    /// Served from the in-memory cache.
+    CacheHit(RedisBlockData),
+    /// Served from Redis and cached.
+    RedisHit(RedisBlockData),
+    /// Cache miss with no Redis access (cache-only mode).
+    CacheOnlyMiss,
+    /// Cache miss and Redis did not have usable data.
+    RedisMiss,
+}
+
+impl BlockLookupResult {
+    pub fn metric_label(&self) -> &'static str {
+        match self {
+            BlockLookupResult::CacheHit(_) => "lookup.cache_hit",
+            BlockLookupResult::RedisHit(_) => "lookup.redis_hit",
+            BlockLookupResult::CacheOnlyMiss => "lookup.cache_only_miss",
+            BlockLookupResult::RedisMiss => "lookup.redis_miss",
+        }
+    }
 }
 
 pub struct HashStore {
@@ -89,15 +112,15 @@ impl HashStore {
     /// Retrieve block data from cache or Redis.
     ///
     /// When cache_only_mode is true, only the LRU cache is checked.
-    pub async fn get_block_data(&self, height: u64) -> Option<RedisBlockData> {
+    pub async fn get_block_data(&self, height: u64) -> BlockLookupResult {
         if let Some(data) = self.get_from_cache(height) {
             self.stats.cache_hits.fetch_add(1, Ordering::Relaxed);
-            return Some(data);
+            return BlockLookupResult::CacheHit(data);
         }
         self.stats.cache_misses.fetch_add(1, Ordering::Relaxed);
 
         if self.cache_only_mode {
-            return None;
+            return BlockLookupResult::CacheOnlyMiss;
         }
 
         match self.fetch_from_redis(height).await {
@@ -105,11 +128,11 @@ impl HashStore {
                 self.stats.redis_hits.fetch_add(1, Ordering::Relaxed);
                 let mut cache = self.cache.write();
                 cache.put(height, data.clone());
-                Some(data)
+                BlockLookupResult::RedisHit(data)
             }
             None => {
                 self.stats.redis_misses.fetch_add(1, Ordering::Relaxed);
-                None
+                BlockLookupResult::RedisMiss
             }
         }
     }
@@ -154,7 +177,7 @@ impl HashStore {
         let result: redis::RedisResult<Option<String>> = conn.get(&key).await;
 
         match result {
-            Ok(Some(payload)) => match serde_json::from_str::<Value>(&payload) {
+            Ok(Some(payload)) => match sonic_rs::from_str::<Value>(&payload) {
                 Ok(value) => match parse_redis_block_data(&value) {
                     Ok(data) => Some(data),
                     Err(RedisBlockParseError::MissingHash) => {
@@ -210,33 +233,34 @@ impl HashStore {
 }
 
 fn extract_hash(value: &Value) -> Option<String> {
-    match value {
-        Value::String(s) => Some(s.clone()),
-        Value::Object(map) => {
-            if let Some(hash) = map
-                .get("hash")
-                .and_then(|h| h.as_str())
-                .map(|s| s.to_string())
-            {
+    if let Some(s) = value.as_str() {
+        return Some(s.to_string());
+    }
+
+    if let Some(map) = value.as_object() {
+        if let Some(hash) = map
+            .get(&"hash".to_string())
+            .and_then(|h| h.as_str())
+            .map(|s| s.to_string())
+        {
+            return Some(hash);
+        }
+        for (_, nested) in map.iter() {
+            if let Some(hash) = extract_hash(nested) {
                 return Some(hash);
             }
-            for nested in map.values() {
-                if let Some(hash) = extract_hash(nested) {
-                    return Some(hash);
-                }
-            }
-            None
         }
-        Value::Array(items) => {
-            for item in items {
-                if let Some(hash) = extract_hash(item) {
-                    return Some(hash);
-                }
-            }
-            None
-        }
-        _ => None,
     }
+
+    if let Some(items) = value.as_array() {
+        for item in items.iter() {
+            if let Some(hash) = extract_hash(item) {
+                return Some(hash);
+            }
+        }
+    }
+
+    None
 }
 
 enum RedisBlockParseError {
@@ -253,13 +277,13 @@ fn parse_redis_block_data(value: &Value) -> Result<RedisBlockData, RedisBlockPar
         .ok_or(RedisBlockParseError::NotJsonObject)?;
 
     let block_time = map
-        .get("blockTime")
+        .get(&"blockTime".to_string())
         .and_then(|v| v.as_u64())
-        .or_else(|| map.get("block_time").and_then(|v| v.as_u64()))
+        .or_else(|| map.get(&"block_time".to_string()).and_then(|v| v.as_u64()))
         .ok_or(RedisBlockParseError::MissingBlockTime)?;
 
     let proposer = map
-        .get("proposer")
+        .get(&"proposer".to_string())
         .and_then(|v| v.as_str())
         .map(|s| s.to_string())
         .ok_or(RedisBlockParseError::MissingProposer)?;

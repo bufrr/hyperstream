@@ -9,13 +9,14 @@ use crate::parsers::{
 use crate::sorter_client::proto::DataRecord;
 use anyhow::{bail, Context, Result};
 use serde::{Deserialize, Serialize};
-use serde_json::Value;
+use sonic_rs::{JsonContainerTrait, JsonValueTrait, Value};
 use std::path::Path;
 use std::sync::Arc;
 use tracing::warn;
 
 /// Maximum buffer size before refusing to accept more data (32 MiB).
 const MAX_BUFFER_SIZE: usize = 32 * 1024 * 1024;
+const TRANSACTIONS_TOPIC: &str = "hl.transactions";
 
 /// Combined parser for `replica_cmds` files that generates both blocks and transactions.
 ///
@@ -109,7 +110,7 @@ struct ResponseBundle(
     Vec<ActionResponse>,
 );
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Default)]
 struct ActionResponse {
     #[serde(default, deserialize_with = "deserialize_option_string")]
     user: Option<String>,
@@ -159,7 +160,10 @@ impl crate::parsers::Parser for ReplicaCmdsParser {
                 incoming_data_size = data.len(),
                 "ReplicaCmdsParser buffer size limit exceeded"
             );
-            bail!("ReplicaCmdsParser buffer exceeded {} bytes", MAX_BUFFER_SIZE);
+            bail!(
+                "ReplicaCmdsParser buffer exceeded {} bytes",
+                MAX_BUFFER_SIZE
+            );
         }
 
         self.buffer.extend_from_slice(data);
@@ -183,7 +187,7 @@ impl crate::parsers::Parser for ReplicaCmdsParser {
             let calculated_height = self.starting_block.map(|start| start + self.line_count + 1);
 
             // Parse JSON once and process both blocks and transactions
-            match serde_json::from_slice::<ReplicaCmd>(&line) {
+            match sonic_rs::from_slice::<ReplicaCmd>(&line) {
                 Ok(cmd) => {
                     // Process the parsed command - this will generate both blocks and transactions
                     self.process_replica_cmd(cmd, calculated_height, &mut records)?;
@@ -306,11 +310,14 @@ impl ReplicaCmdsParser {
         }
 
         // --- Process TRANSACTION data ---
-        let actions = flatten_actions(signed_action_bundles);
-        let responses = flatten_responses(resps);
-
-        let action_count = actions.len();
-        let response_count = responses.len();
+        let action_count: usize = signed_action_bundles
+            .iter()
+            .map(|bundle| bundle.1.signed_actions.len())
+            .sum();
+        let response_count: usize = resps
+            .as_ref()
+            .map(|resp| resp.full.iter().map(|bundle| bundle.1.len()).sum())
+            .unwrap_or(0);
         if action_count != response_count {
             warn!(
                 round,
@@ -320,14 +327,14 @@ impl ReplicaCmdsParser {
             );
         }
 
-        let mut responses_iter = responses.into_iter();
-        for signed_action in actions {
-            let response = responses_iter.next().unwrap_or_else(|| ActionResponse {
-                user: None,
-                res: ResponseResult::default(),
-            });
+        records.reserve(action_count);
 
-            let ActionResponse { user, res } = response;
+        let mut actions = ActionIter::new(signed_action_bundles);
+        let mut responses = ResponseIter::new(resps);
+        let topic = TRANSACTIONS_TOPIC.to_string();
+
+        while let Some(signed_action) = actions.next() {
+            let ActionResponse { user, res } = responses.next().unwrap_or_default();
             let tx = TransactionRecord {
                 time: timestamp,
                 user: user.unwrap_or_default(),
@@ -337,82 +344,119 @@ impl ReplicaCmdsParser {
                 error: parse_error(&res),
             };
 
+            // Skip empty/null transactions to match legacy behavior
+            if tx.user.is_empty() && tx.action.is_null() {
+                continue;
+            }
+
             // Propagate serialization errors to maintain parity with original TransactionsParser
-            records.push(transaction_to_data_record(tx, block_height)?);
+            let payload =
+                sonic_rs::to_vec(&tx).context("failed to encode hl.transactions payload")?;
+
+            records.push(DataRecord {
+                block_height: Some(block_height),
+                tx_hash: None,
+                timestamp: tx.time,
+                topic: topic.clone(),
+                payload,
+            });
         }
 
         Ok(())
     }
 }
 
-fn flatten_actions(mut bundles: Vec<BundleWithHash>) -> Vec<SignedAction> {
-    let capacity = bundles
-        .iter()
-        .map(|bundle| bundle.1.signed_actions.len())
-        .sum();
-    let mut actions = Vec::with_capacity(capacity);
-    for BundleWithHash(_, bundle) in bundles.drain(..) {
-        actions.extend(bundle.signed_actions);
-    }
-    actions
+struct ActionIter {
+    bundles: std::vec::IntoIter<BundleWithHash>,
+    current: Option<std::vec::IntoIter<SignedAction>>,
 }
 
-fn flatten_responses(resps: Option<Resps>) -> Vec<ActionResponse> {
-    let Some(resps) = resps else {
-        return Vec::new();
-    };
-
-    let capacity = resps.full.iter().map(|bundle| bundle.1.len()).sum();
-    let mut responses = Vec::with_capacity(capacity);
-    for ResponseBundle(hash, bundle_responses) in resps.full {
-        let _ = hash;
-        responses.extend(bundle_responses);
+impl ActionIter {
+    fn new(bundles: Vec<BundleWithHash>) -> Self {
+        Self {
+            bundles: bundles.into_iter(),
+            current: None,
+        }
     }
-    responses
 }
 
-fn transaction_to_data_record(mut tx: TransactionRecord, block_height: u64) -> Result<DataRecord> {
-    let payload = serde_json::to_vec(&tx).context("failed to encode hl.transactions payload")?;
-    let raw_hash = std::mem::take(&mut tx.hash);
-    let metadata_hash = if raw_hash.trim().is_empty() {
-        None
-    } else {
-        Some(raw_hash)
-    };
+impl Iterator for ActionIter {
+    type Item = SignedAction;
 
-    Ok(DataRecord {
-        block_height: Some(block_height),
-        tx_hash: metadata_hash,
-        timestamp: tx.time,
-        topic: "hl.transactions".to_string(),
-        payload,
-    })
+    fn next(&mut self) -> Option<Self::Item> {
+        loop {
+            if let Some(actions) = self.current.as_mut() {
+                if let Some(action) = actions.next() {
+                    return Some(action);
+                }
+            }
+
+            let next_bundle = self.bundles.next()?;
+            self.current = Some(next_bundle.1.signed_actions.into_iter());
+        }
+    }
+}
+
+struct ResponseIter {
+    bundles: std::vec::IntoIter<ResponseBundle>,
+    current: Option<std::vec::IntoIter<ActionResponse>>,
+}
+
+impl ResponseIter {
+    fn new(resps: Option<Resps>) -> Self {
+        let bundles = resps
+            .map(|resps| resps.full.into_iter())
+            .unwrap_or_else(|| Vec::new().into_iter());
+
+        Self {
+            bundles: bundles.into_iter(),
+            current: None,
+        }
+    }
+}
+
+impl Iterator for ResponseIter {
+    type Item = ActionResponse;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        loop {
+            if let Some(responses) = self.current.as_mut() {
+                if let Some(response) = responses.next() {
+                    return Some(response);
+                }
+            }
+
+            let next_bundle = self.bundles.next()?;
+            self.current = Some(next_bundle.1.into_iter());
+        }
+    }
 }
 
 fn parse_error(res: &ResponseResult) -> Option<String> {
-    match res.status.as_deref().unwrap_or("") {
-        "err" => res.response.as_str().map(|msg| msg.to_string()),
-        "ok" => match &res.response {
-            Value::Object(map) => map
-                .get("data")
-                .and_then(Value::as_object)
-                .and_then(|data| data.get("statuses"))
-                .and_then(Value::as_array)
-                .map(|statuses| {
-                    statuses
-                        .iter()
-                        .filter_map(|status| {
-                            status
-                                .get("error")
-                                .and_then(Value::as_str)
-                                .map(|msg| msg.to_string())
-                        })
-                        .collect::<Vec<String>>()
-                })
-                .filter(|errors| !errors.is_empty())
-                .map(|errors| errors.join("; ")),
-            _ => None,
-        },
+    const DATA_KEY: &str = "data";
+    const STATUSES_KEY: &str = "statuses";
+    const ERROR_KEY: &str = "error";
+
+    match res.status.as_deref() {
+        Some("err") => res.response.as_str().map(|msg| msg.to_string()),
+        Some("ok") => {
+            let statuses = res.response.get(DATA_KEY)?.get(STATUSES_KEY)?.as_array()?;
+
+            let mut combined: Option<String> = None;
+            for status in statuses {
+                if let Some(msg) = status.get(ERROR_KEY).and_then(Value::as_str) {
+                    match &mut combined {
+                        Some(existing) => {
+                            existing.push_str("; ");
+                            existing.push_str(msg);
+                        }
+                        None => combined = Some(msg.to_owned()),
+                    }
+                }
+            }
+
+            combined
+        }
         _ => None,
     }
 }
@@ -425,7 +469,7 @@ mod tests {
     fn parse_error_from_err_status() {
         let res = ResponseResult {
             status: Some("err".to_string()),
-            response: serde_json::json!("Invalid nonce: duplicate nonce 1764221206959"),
+            response: sonic_rs::json!("Invalid nonce: duplicate nonce 1764221206959"),
         };
         assert_eq!(
             parse_error(&res),
@@ -437,7 +481,7 @@ mod tests {
     fn parse_error_from_ok_status_with_nested_error() {
         let res = ResponseResult {
             status: Some("ok".to_string()),
-            response: serde_json::json!({
+            response: sonic_rs::json!({
                 "type": "order",
                 "data": {
                     "statuses": [
@@ -459,7 +503,7 @@ mod tests {
     fn parse_error_from_ok_status_success() {
         let res = ResponseResult {
             status: Some("ok".to_string()),
-            response: serde_json::json!({
+            response: sonic_rs::json!({
                 "type": "order",
                 "data": {
                     "statuses": [{"resting": {"oid": 123456}}]

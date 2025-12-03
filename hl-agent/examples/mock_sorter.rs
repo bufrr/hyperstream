@@ -274,7 +274,7 @@ impl RecordWriter {
         let filename = format!("batch-{idx}.json");
         let path = self.dir.join(filename);
         let snapshot = BatchSnapshot::from_batch(batch);
-        let data = serde_json::to_vec_pretty(&snapshot).map_err(io::Error::other)?;
+        let data = sonic_rs::to_vec_pretty(&snapshot).map_err(io::Error::other)?;
         tokio::fs::write(path, data).await
     }
 }

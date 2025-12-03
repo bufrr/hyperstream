@@ -58,6 +58,7 @@ struct ParsedChunk {
     chunk_start: u64,
     read_latency_ms: u128,
     parse_latency_ms: u128,
+    parser_types: Vec<&'static str>,
     checkpoint_offset: u64,
     file_size: u64,
     last_modified_ts: i64,
@@ -239,7 +240,7 @@ impl TailerState {
                     line_count,
                     checkpoint_db,
                 )
-                    .await?;
+                .await?;
 
                 return Ok(ChunkOutcome::ParseFailed);
             }
@@ -267,11 +268,17 @@ impl TailerState {
             .unwrap_or(0);
         let checkpoint_offset = self.read_offset.saturating_sub(backlog as u64);
         let line_count = max_line_count(&self.active_parsers);
+        let parser_types = self
+            .active_parsers
+            .iter()
+            .map(|parser| parser.parser_type())
+            .collect();
 
         Ok(ChunkOutcome::Parsed(ParsedChunk {
             chunk_start,
             read_latency_ms,
             parse_latency_ms,
+            parser_types,
             checkpoint_offset,
             file_size: updated_file_size,
             last_modified_ts: updated_last_modified_ts,
@@ -435,12 +442,8 @@ async fn run_tail_loop(
                     update_checkpoint(&state.file_path, &chunk, &checkpoint_db).await?;
 
                     if !had_records
-                        && sleep_or_shutdown(
-                            state.sleep_interval,
-                            &cancel_token,
-                            &mut shutdown_rx,
-                        )
-                        .await
+                        && sleep_or_shutdown(state.sleep_interval, &cancel_token, &mut shutdown_rx)
+                            .await
                     {
                         info!(path = %state.file_path.display(), "tailer received shutdown signal");
                         return Ok(());
@@ -499,9 +502,12 @@ async fn dispatch_batches(
         chunk.chunk_start,
         batches,
         |batch_idx, record_count| {
-            let total_latency_ms = Instant::now()
-                .duration_since(loop_start)
-                .as_millis();
+            let total_latency_ms = Instant::now().duration_since(loop_start).as_millis();
+            for parser_type in &chunk.parser_types {
+                crate::metrics::END_TO_END_LATENCY
+                    .with_label_values(&[parser_type])
+                    .observe(total_latency_ms as f64 / 1000.0);
+            }
             info!(
                 path = %file_path.display(),
                 batch_idx,
@@ -642,7 +648,11 @@ where
             .await;
         let send_duration = send_start.elapsed();
 
-        let status = if send_result.is_ok() { "success" } else { "error" };
+        let status = if send_result.is_ok() {
+            "success"
+        } else {
+            "error"
+        };
         crate::metrics::SORTER_SEND_DURATION
             .with_label_values(&[status])
             .observe(send_duration.as_secs_f64());
@@ -874,9 +884,13 @@ async fn tail_blocks_file_bulk(
                     )
                     .await?;
 
-                    let total_latency_ms = std::time::Instant::now()
-                        .duration_since(loop_start)
-                        .as_millis();
+                    let total_latency = std::time::Instant::now().duration_since(loop_start);
+                    for parser_type in active_parsers.iter().map(|parser| parser.parser_type()) {
+                        crate::metrics::END_TO_END_LATENCY
+                            .with_label_values(&[parser_type])
+                            .observe(total_latency.as_secs_f64());
+                    }
+                    let total_latency_ms = total_latency.as_millis();
                     info!(path = %file_path.display(), total_records, read_latency_ms, parse_latency_ms, total_latency_ms, "bulk load complete - all batches sent");
                 }
 

@@ -240,7 +240,7 @@ fn emit_trade_record(
         users,
     };
 
-    let payload = serde_json::to_vec(&trade).context("failed to encode trade payload to JSON")?;
+    let payload = sonic_rs::to_vec(&trade).context("failed to encode trade payload to JSON")?;
 
     let block_height = primary
         .block_height

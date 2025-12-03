@@ -81,9 +81,7 @@ impl FileRunner {
             event_rx,
             active_tailers: Arc::new(Mutex::new(HashMap::new())),
             file_activity: Arc::new(Mutex::new(HashMap::new())),
-            tailer_semaphore: Arc::new(Semaphore::new(
-                config.performance.max_concurrent_tailers,
-            )),
+            tailer_semaphore: Arc::new(Semaphore::new(config.performance.max_concurrent_tailers)),
             cancel_token,
             watcher_handle: None,
             activity_monitor_handle: None,
@@ -260,7 +258,9 @@ impl FileRunner {
 
             match watcher_result {
                 Some(Ok(())) => info!("file watcher stopped"),
-                Some(Err(err)) => warn!(error = %err, "file watcher exited with error during shutdown"),
+                Some(Err(err)) => {
+                    warn!(error = %err, "file watcher exited with error during shutdown")
+                }
                 None => {
                     warn!("file watcher did not stop within timeout; aborting");
                     handle.abort();

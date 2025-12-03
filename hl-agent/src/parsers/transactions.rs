@@ -7,7 +7,7 @@ use crate::parsers::{
 use crate::sorter_client::proto::DataRecord;
 use anyhow::{bail, Context, Result};
 use serde::{Deserialize, Serialize};
-use serde_json::Value;
+use sonic_rs::{JsonContainerTrait, JsonValueTrait, Value};
 use std::path::Path;
 use tracing::warn;
 
@@ -170,7 +170,7 @@ impl Parser for TransactionsParser {
             // e.g., file "810800000" contains blocks 810800001 to 810810000
             let calculated_height = self.starting_block.map(|start| start + self.line_count + 1);
 
-            match serde_json::from_slice::<ReplicaCmd>(&line) {
+            match sonic_rs::from_slice::<ReplicaCmd>(&line) {
                 Ok(cmd) => {
                     self.process_replica_cmd(cmd, calculated_height, &mut records)?;
                 }
@@ -300,7 +300,7 @@ fn flatten_responses(resps: Option<Resps>) -> Vec<ActionResponse> {
 }
 
 fn transaction_to_data_record(mut tx: TransactionRecord, block_height: u64) -> Result<DataRecord> {
-    let payload = serde_json::to_vec(&tx).context("failed to encode hl.transactions payload")?;
+    let payload = sonic_rs::to_vec(&tx).context("failed to encode hl.transactions payload")?;
     let raw_hash = std::mem::take(&mut tx.hash);
     let metadata_hash = if raw_hash.trim().is_empty() {
         None
@@ -320,27 +320,28 @@ fn transaction_to_data_record(mut tx: TransactionRecord, block_height: u64) -> R
 fn parse_error(res: &ResponseResult) -> Option<String> {
     match res.status.as_deref().unwrap_or("") {
         "err" => res.response.as_str().map(|msg| msg.to_string()),
-        "ok" => match &res.response {
-            Value::Object(map) => map
-                .get("data")
-                .and_then(Value::as_object)
-                .and_then(|data| data.get("statuses"))
-                .and_then(Value::as_array)
-                .map(|statuses| {
-                    statuses
-                        .iter()
-                        .filter_map(|status| {
-                            status
-                                .get("error")
-                                .and_then(Value::as_str)
+        "ok" => res
+            .response
+            .as_object()
+            .and_then(|map| map.get(&"data".to_string()))
+            .and_then(|data| data.as_object())
+            .and_then(|data| data.get(&"statuses".to_string()))
+            .and_then(|statuses| statuses.as_array())
+            .map(|statuses| {
+                statuses
+                    .iter()
+                    .filter_map(|status| {
+                        status.as_object().and_then(|status_obj| {
+                            status_obj
+                                .get(&"error".to_string())
+                                .and_then(|v| v.as_str())
                                 .map(|msg| msg.to_string())
                         })
-                        .collect::<Vec<String>>()
-                })
-                .filter(|errors| !errors.is_empty())
-                .map(|errors| errors.join("; ")),
-            _ => None,
-        },
+                    })
+                    .collect::<Vec<String>>()
+            })
+            .filter(|errors| !errors.is_empty())
+            .map(|errors| errors.join("; ")),
         _ => None,
     }
 }
@@ -353,7 +354,7 @@ mod tests {
     fn parse_error_from_err_status() {
         let res = ResponseResult {
             status: Some("err".to_string()),
-            response: serde_json::json!("Invalid nonce: duplicate nonce 1764221206959"),
+            response: sonic_rs::json!("Invalid nonce: duplicate nonce 1764221206959"),
         };
         assert_eq!(
             parse_error(&res),
@@ -365,7 +366,7 @@ mod tests {
     fn parse_error_from_ok_status_with_nested_error() {
         let res = ResponseResult {
             status: Some("ok".to_string()),
-            response: serde_json::json!({
+            response: sonic_rs::json!({
                 "type": "order",
                 "data": {
                     "statuses": [
@@ -387,7 +388,7 @@ mod tests {
     fn parse_error_from_ok_status_success() {
         let res = ResponseResult {
             status: Some("ok".to_string()),
-            response: serde_json::json!({
+            response: sonic_rs::json!({
                 "type": "order",
                 "data": {
                     "statuses": [{"resting": {"oid": 123456}}]

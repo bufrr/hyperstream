@@ -1,14 +1,15 @@
 //! Block merger for combining replica_cmds file data with Explorer hashes stored in HashStore.
 
-use super::hash_store::HashStore;
+use super::hash_store::{BlockLookupResult, HashStore};
 use super::schemas::Block;
 use serde::{Deserialize, Serialize};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::env;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, OnceLock};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tokio::runtime::{Builder, Handle};
 use tokio::task;
-use tracing::{info, warn};
+use tracing::{debug, info, warn};
 
 /// Final merged block record ready for output.
 /// This is a type alias for the shared Block schema.
@@ -95,6 +96,10 @@ pub struct BlockMerger {
 }
 
 static GLOBAL_BLOCK_MERGER: OnceLock<Arc<BlockMerger>> = OnceLock::new();
+static REDIS_MISS_LOGGED: AtomicBool = AtomicBool::new(false);
+static EXPLORER_FALLBACK_DISABLED: OnceLock<bool> = OnceLock::new();
+
+const DISABLE_EXPLORER_FALLBACK_ENV: &str = "HL_AGENT_DISABLE_EXPLORER_FALLBACK";
 
 /// Single attempt to fetch block from Explorer API
 async fn fetch_block_from_explorer_once(height: u64) -> Result<ExplorerBlockData, String> {
@@ -106,7 +111,7 @@ async fn fetch_block_from_explorer_once(height: u64) -> Result<ExplorerBlockData
 
     let response = client
         .post("https://rpc.hyperliquid.xyz/explorer")
-        .json(&serde_json::json!({
+        .json(&sonic_rs::json!({
             "height": height,
             "type": "blockDetails",
         }))
@@ -184,6 +189,26 @@ async fn fetch_block_from_explorer(height: u64) -> Result<ExplorerBlockData, Str
     Err(last_error)
 }
 
+fn explorer_fallback_disabled() -> bool {
+    *EXPLORER_FALLBACK_DISABLED.get_or_init(|| {
+        let disabled = env::var(DISABLE_EXPLORER_FALLBACK_ENV)
+            .map(|value| {
+                let trimmed = value.trim();
+                trimmed == "1" || trimmed.eq_ignore_ascii_case("true")
+            })
+            .unwrap_or(false);
+
+        if disabled {
+            info!(
+                env = DISABLE_EXPLORER_FALLBACK_ENV,
+                "Explorer API fallback disabled via environment; blocks will be emitted without hashes on cache miss"
+            );
+        }
+
+        disabled
+    })
+}
+
 impl Default for BlockMerger {
     fn default() -> Self {
         Self {
@@ -223,8 +248,17 @@ impl BlockMerger {
     pub async fn process_file_block(&self, data: ReplicaBlockData) -> Option<MergedBlock> {
         self.stats.blocks_processed.fetch_add(1, Ordering::Relaxed);
 
-        match self.hash_store.get_block_data(data.height).await {
-            Some(redis_data) => {
+        let total_start = Instant::now();
+        let lookup_start = Instant::now();
+        let lookup = self.hash_store.get_block_data(data.height).await;
+        let lookup_elapsed = lookup_start.elapsed();
+
+        crate::metrics::BLOCK_MERGER_DURATION
+            .with_label_values(&[lookup.metric_label()])
+            .observe(lookup_elapsed.as_secs_f64());
+
+        match lookup {
+            BlockLookupResult::CacheHit(redis_data) | BlockLookupResult::RedisHit(redis_data) => {
                 let block_time_match = redis_data.block_time == data.block_time;
                 let proposer_match =
                     redis_data.proposer.to_lowercase() == data.proposer.to_lowercase();
@@ -234,6 +268,9 @@ impl BlockMerger {
                     crate::metrics::REDIS_CACHE_TOTAL
                         .with_label_values(&["hit"])
                         .inc();
+                    crate::metrics::BLOCK_MERGER_DURATION
+                        .with_label_values(&["total.emitted"])
+                        .observe(total_start.elapsed().as_secs_f64());
                     Some(MergedBlock::from_replica_data(data, Some(redis_data.hash)))
                 } else {
                     self.stats.hash_misses.fetch_add(1, Ordering::Relaxed);
@@ -254,6 +291,9 @@ impl BlockMerger {
                     crate::metrics::REDIS_CACHE_TOTAL
                         .with_label_values(&["miss"])
                         .inc();
+                    crate::metrics::BLOCK_MERGER_DURATION
+                        .with_label_values(&["total.dropped"])
+                        .observe(total_start.elapsed().as_secs_f64());
 
                     warn!(
                         height = data.height,
@@ -266,18 +306,43 @@ impl BlockMerger {
                     None
                 }
             }
-            None => {
+            BlockLookupResult::CacheOnlyMiss | BlockLookupResult::RedisMiss => {
                 // No Redis data - try Explorer API fallback before emitting without hash
                 self.stats.hash_misses.fetch_add(1, Ordering::Relaxed);
                 crate::metrics::REDIS_CACHE_TOTAL
                     .with_label_values(&["miss"])
                     .inc();
-                warn!(
-                    height = data.height,
-                    "No Redis data for block; trying Explorer API fallback (will emit without hash on failure)"
-                );
 
-                match fetch_block_from_explorer(data.height).await {
+                if explorer_fallback_disabled() {
+                    debug!(
+                        height = data.height,
+                        "Explorer fallback disabled; emitting block without hash"
+                    );
+                    crate::metrics::BLOCK_MERGER_DURATION
+                        .with_label_values(&["total.emitted"])
+                        .observe(total_start.elapsed().as_secs_f64());
+                    return Some(MergedBlock::from_replica_data(data, None));
+                }
+
+                if !REDIS_MISS_LOGGED.swap(true, Ordering::Relaxed) {
+                    warn!(
+                        height = data.height,
+                        "No Redis data for block; trying Explorer API fallback (subsequent misses logged at debug)"
+                    );
+                } else {
+                    debug!(
+                        height = data.height,
+                        "No Redis data for block; Explorer API fallback path"
+                    );
+                }
+
+                let fallback_start = Instant::now();
+                let result = fetch_block_from_explorer(data.height).await;
+                crate::metrics::BLOCK_MERGER_DURATION
+                    .with_label_values(&["fallback"])
+                    .observe(fallback_start.elapsed().as_secs_f64());
+
+                match result {
                     Ok(explorer_data) => {
                         let block_time_match = explorer_data.block_time == data.block_time;
                         let proposer_match =
@@ -287,6 +352,9 @@ impl BlockMerger {
                             crate::metrics::EXPLORER_API_FALLBACK_TOTAL
                                 .with_label_values(&["success"])
                                 .inc();
+                            crate::metrics::BLOCK_MERGER_DURATION
+                                .with_label_values(&["total.emitted"])
+                                .observe(total_start.elapsed().as_secs_f64());
                             Some(MergedBlock::from_replica_data(
                                 data,
                                 Some(explorer_data.hash),
@@ -309,6 +377,9 @@ impl BlockMerger {
                             crate::metrics::EXPLORER_API_FALLBACK_TOTAL
                                 .with_label_values(&["validation_failed"])
                                 .inc();
+                            crate::metrics::BLOCK_MERGER_DURATION
+                                .with_label_values(&["total.dropped"])
+                                .observe(total_start.elapsed().as_secs_f64());
 
                             warn!(
                                 height = data.height,
@@ -331,6 +402,9 @@ impl BlockMerger {
                         crate::metrics::EXPLORER_API_FALLBACK_TOTAL
                             .with_label_values(&["api_error"])
                             .inc();
+                        crate::metrics::BLOCK_MERGER_DURATION
+                            .with_label_values(&["total.emitted"])
+                            .observe(total_start.elapsed().as_secs_f64());
 
                         warn!(
                             height = data.height,

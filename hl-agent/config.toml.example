@@ -57,3 +57,7 @@ redis_url = "redis://127.0.0.1:6379"
 # Retry behavior for sorter send failures (defaults: 5 attempts, 500ms base backoff)
 # sink_retry_max_attempts = 5
 # sink_retry_base_delay_ms = 500
+
+# Performance override (environment):
+# Set HL_AGENT_DISABLE_EXPLORER_FALLBACK=true to skip Explorer API lookups when Redis misses.
+# This avoids per-block network retries in high-throughput deployments where missing hashes are acceptable.

@@ -1,7 +1,11 @@
-use serde::de::DeserializeOwned;
-use serde::Deserialize;
-use std::path::Path;
-use std::time::{SystemTime, UNIX_EPOCH};
+use serde::de::{DeserializeOwned, MapAccess, SeqAccess, Visitor};
+use sonic_rs::{JsonValueTrait, Value};
+use std::{
+    fmt,
+    marker::PhantomData,
+    path::Path,
+    time::{SystemTime, UNIX_EPOCH},
+};
 
 pub const LINE_PREVIEW_LIMIT: usize = 256;
 
@@ -17,22 +21,28 @@ where
     D: serde::Deserializer<'de>,
 {
     use serde::Deserialize;
-    let value = Option::<serde_json::Value>::deserialize(deserializer)?;
+    let value = Option::<Value>::deserialize(deserializer)?;
     match value {
-        None | Some(serde_json::Value::Null) => Ok(None),
-        Some(serde_json::Value::String(s)) => {
-            let trimmed = s.trim();
-            if trimmed.is_empty() {
-                Ok(None)
+        None => Ok(None),
+        Some(val) if val.is_null() => Ok(None),
+        Some(val) => {
+            if let Some(s) = val.as_str() {
+                let trimmed = s.trim();
+                if trimmed.is_empty() {
+                    Ok(None)
+                } else {
+                    Ok(Some(trimmed.to_string()))
+                }
+            } else if let Some(n) = val.as_number() {
+                Ok(Some(n.to_string()))
+            } else if let Some(b) = val.as_bool() {
+                Ok(Some(b.to_string()))
             } else {
-                Ok(Some(trimmed.to_string()))
+                Err(serde::de::Error::custom(format!(
+                    "expected string or null, got {val:?}"
+                )))
             }
         }
-        Some(serde_json::Value::Number(n)) => Ok(Some(n.to_string())),
-        Some(serde_json::Value::Bool(b)) => Ok(Some(b.to_string())),
-        Some(other) => Err(serde::de::Error::custom(format!(
-            "expected string or null, got {other:?}"
-        ))),
     }
 }
 
@@ -80,15 +90,23 @@ where
     D: serde::Deserializer<'de>,
 {
     use serde::Deserialize;
-    let value = Option::<serde_json::Value>::deserialize(deserializer)?;
+    let value = Option::<Value>::deserialize(deserializer)?;
     match value {
-        None | Some(serde_json::Value::Null) => Ok(String::new()),
-        Some(serde_json::Value::String(s)) => Ok(s),
-        Some(serde_json::Value::Number(n)) => Ok(n.to_string()),
-        Some(serde_json::Value::Bool(b)) => Ok(b.to_string()),
-        Some(other) => Err(serde::de::Error::custom(format!(
-            "expected string or number, got {other:?}"
-        ))),
+        None => Ok(String::new()),
+        Some(val) if val.is_null() => Ok(String::new()),
+        Some(val) => {
+            if let Some(s) = val.as_str() {
+                Ok(s.to_string())
+            } else if let Some(n) = val.as_number() {
+                Ok(n.to_string())
+            } else if let Some(b) = val.as_bool() {
+                Ok(b.to_string())
+            } else {
+                Err(serde::de::Error::custom(format!(
+                    "expected string or number, got {val:?}"
+                )))
+            }
+        }
     }
 }
 
@@ -97,20 +115,27 @@ where
     D: serde::Deserializer<'de>,
 {
     use serde::Deserialize;
-    let value = Option::<serde_json::Value>::deserialize(deserializer)?;
+    let value = Option::<Value>::deserialize(deserializer)?;
     match value {
-        None | Some(serde_json::Value::Null) => Ok(0),
-        Some(serde_json::Value::Number(n)) => n
-            .as_u64()
-            .ok_or_else(|| serde::de::Error::custom("expected u64-compatible number")),
-        Some(serde_json::Value::String(s)) => s
-            .parse::<u64>()
-            .map_err(|_| serde::de::Error::custom(format!("failed to parse u64 from {s:?}"))),
-        Some(serde_json::Value::Bool(true)) => Ok(1),
-        Some(serde_json::Value::Bool(false)) => Ok(0),
-        Some(other) => Err(serde::de::Error::custom(format!(
-            "expected number, got {other:?}"
-        ))),
+        None => Ok(0),
+        Some(val) if val.is_null() => Ok(0),
+        Some(val) => {
+            if let Some(num) = val.as_u64() {
+                Ok(num)
+            } else if let Some(s) = val.as_str() {
+                s.parse::<u64>().map_err(|_| {
+                    serde::de::Error::custom(format!("failed to parse u64 from {s:?}"))
+                })
+            } else if let Some(true) = val.as_bool() {
+                Ok(1)
+            } else if let Some(false) = val.as_bool() {
+                Ok(0)
+            } else {
+                Err(serde::de::Error::custom(format!(
+                    "expected number, got {val:?}"
+                )))
+            }
+        }
     }
 }
 
@@ -121,27 +146,31 @@ where
     D: serde::Deserializer<'de>,
 {
     use serde::Deserialize;
-    let value = Option::<serde_json::Value>::deserialize(deserializer)?;
+    let value = Option::<Value>::deserialize(deserializer)?;
     match value {
-        None | Some(serde_json::Value::Null) => Ok(None),
-        Some(serde_json::Value::Number(n)) => n
-            .as_u64()
-            .ok_or_else(|| serde::de::Error::custom("expected u64-compatible number"))
-            .map(Some),
-        Some(serde_json::Value::String(s)) => {
-            if s.trim().is_empty() {
-                Ok(None)
+        None => Ok(None),
+        Some(val) if val.is_null() => Ok(None),
+        Some(val) => {
+            if let Some(num) = val.as_u64() {
+                Ok(Some(num))
+            } else if let Some(s) = val.as_str() {
+                if s.trim().is_empty() {
+                    Ok(None)
+                } else {
+                    s.parse::<u64>().map(Some).map_err(|_| {
+                        serde::de::Error::custom(format!("failed to parse u64 from {s:?}"))
+                    })
+                }
+            } else if let Some(true) = val.as_bool() {
+                Ok(Some(1))
+            } else if let Some(false) = val.as_bool() {
+                Ok(Some(0))
             } else {
-                s.parse::<u64>().map(Some).map_err(|_| {
-                    serde::de::Error::custom(format!("failed to parse u64 from {s:?}"))
-                })
+                Err(serde::de::Error::custom(format!(
+                    "expected number, got {val:?}"
+                )))
             }
         }
-        Some(serde_json::Value::Bool(true)) => Ok(Some(1)),
-        Some(serde_json::Value::Bool(false)) => Ok(Some(0)),
-        Some(other) => Err(serde::de::Error::custom(format!(
-            "expected number, got {other:?}"
-        ))),
     }
 }
 
@@ -307,21 +336,53 @@ where
     D: serde::Deserializer<'de>,
     T: DeserializeOwned,
 {
-    let value = Option::<serde_json::Value>::deserialize(deserializer)?;
-    match value {
-        None | Some(serde_json::Value::Null) => Ok(Vec::new()),
-        Some(serde_json::Value::Array(arr)) => arr
-            .into_iter()
-            .map(|item| serde_json::from_value(item).map_err(serde::de::Error::custom))
-            .collect(),
-        Some(serde_json::Value::Object(map)) => map
-            .into_iter()
-            .map(|(_, item)| serde_json::from_value(item).map_err(serde::de::Error::custom))
-            .collect(),
-        Some(other) => Err(serde::de::Error::custom(format!(
-            "expected {context} list or object, got {other:?}"
-        ))),
+    struct FlexibleEventsVisitor<T> {
+        marker: PhantomData<T>,
+        context: &'static str,
     }
+
+    impl<'de, T: DeserializeOwned> Visitor<'de> for FlexibleEventsVisitor<T> {
+        type Value = Vec<T>;
+
+        fn expecting(&self, formatter: &mut fmt::Formatter) -> fmt::Result {
+            write!(formatter, "{} list or object", self.context)
+        }
+
+        fn visit_none<E>(self) -> Result<Self::Value, E> {
+            Ok(Vec::new())
+        }
+
+        fn visit_unit<E>(self) -> Result<Self::Value, E> {
+            Ok(Vec::new())
+        }
+
+        fn visit_seq<A>(self, mut seq: A) -> Result<Self::Value, A::Error>
+        where
+            A: SeqAccess<'de>,
+        {
+            let mut values = Vec::new();
+            while let Some(value) = seq.next_element()? {
+                values.push(value);
+            }
+            Ok(values)
+        }
+
+        fn visit_map<A>(self, mut map: A) -> Result<Self::Value, A::Error>
+        where
+            A: MapAccess<'de>,
+        {
+            let mut values = Vec::new();
+            while let Some((_key, value)) = map.next_entry::<serde::de::IgnoredAny, T>()? {
+                values.push(value);
+            }
+            Ok(values)
+        }
+    }
+
+    deserializer.deserialize_any(FlexibleEventsVisitor {
+        marker: PhantomData,
+        context,
+    })
 }
 
 #[cfg(test)]

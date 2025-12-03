@@ -3,7 +3,7 @@ use crate::sorter_client::BatchSender;
 use anyhow::{anyhow, Context, Result};
 use futures::{stream, StreamExt, TryStreamExt};
 use serde::Serialize;
-use serde_json::{self, Value};
+use sonic_rs::{self, Value};
 use std::collections::HashMap;
 use std::path::PathBuf;
 use tokio::fs;
@@ -56,8 +56,10 @@ impl FileWriter {
     }
 
     fn payload_to_json(payload: &[u8]) -> Value {
-        serde_json::from_slice(payload)
-            .unwrap_or_else(|_| Value::String(String::from_utf8_lossy(payload).into_owned()))
+        sonic_rs::from_slice(payload).unwrap_or_else(|_| {
+            let fallback = String::from_utf8_lossy(payload).into_owned();
+            Value::from(fallback.as_str())
+        })
     }
 
     fn topic_directory(&self, topic: &str) -> PathBuf {
@@ -105,8 +107,8 @@ impl FileWriter {
                 payload: Self::payload_to_json(&record.payload),
             };
 
-            let mut serialized = serde_json::to_vec(&persisted)
-                .context("failed to encode record for file output")?;
+            let mut serialized =
+                sonic_rs::to_vec(&persisted).context("failed to encode record for file output")?;
             serialized.push(b'\n');
             buffer.extend_from_slice(&serialized);
         }

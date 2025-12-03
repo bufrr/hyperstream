@@ -9,7 +9,7 @@ use crate::sorter_client::proto::DataRecord;
 use anyhow::Result;
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
-use serde_json::Value;
+use sonic_rs::Value;
 
 /// Generic batch envelope for `_by_block` file formats.
 ///
@@ -91,7 +91,7 @@ pub struct Block {
 impl Block {
     /// Convert this block to a DataRecord for the `hl.blocks` topic.
     pub fn to_data_record(&self) -> Result<DataRecord> {
-        let payload = serde_json::to_vec(self)?;
+        let payload = sonic_rs::to_vec(self)?;
         Ok(DataRecord {
             block_height: Some(self.height),
             tx_hash: None,
@@ -126,7 +126,7 @@ impl Transaction {}
 #[cfg(test)]
 mod tests {
     use super::*;
-    use serde_json::json;
+    use sonic_rs::json;
 
     #[derive(Debug, Deserialize, PartialEq)]
     struct TestEvent {
@@ -144,7 +144,8 @@ mod tests {
             ]
         });
 
-        let batch: BatchEnvelope<TestEvent> = serde_json::from_value(json).unwrap();
+        let batch_str = sonic_rs::to_string(&json).unwrap();
+        let batch: BatchEnvelope<TestEvent> = sonic_rs::from_str(&batch_str).unwrap();
         assert_eq!(batch.block_number, 12345);
         assert_eq!(batch.events.len(), 2);
         assert_eq!(batch.events[0].id, 1);
@@ -160,7 +161,8 @@ mod tests {
             }
         });
 
-        let batch: BatchEnvelope<TestEvent> = serde_json::from_value(json).unwrap();
+        let batch_str = sonic_rs::to_string(&json).unwrap();
+        let batch: BatchEnvelope<TestEvent> = sonic_rs::from_str(&batch_str).unwrap();
         assert_eq!(batch.block_number, 67890);
         assert_eq!(batch.events.len(), 2);
     }
@@ -172,7 +174,8 @@ mod tests {
             "events": null
         });
 
-        let batch: BatchEnvelope<TestEvent> = serde_json::from_value(json).unwrap();
+        let batch_str = sonic_rs::to_string(&json).unwrap();
+        let batch: BatchEnvelope<TestEvent> = sonic_rs::from_str(&batch_str).unwrap();
         assert_eq!(batch.block_number, 11111);
         assert!(batch.events.is_empty());
     }
@@ -192,7 +195,8 @@ mod tests {
             ]
         });
 
-        let batch: FillBatchEnvelope<TestFill> = serde_json::from_value(json).unwrap();
+        let batch_str = sonic_rs::to_string(&json).unwrap();
+        let batch: FillBatchEnvelope<TestFill> = sonic_rs::from_str(&batch_str).unwrap();
         assert_eq!(batch.block_number, 99999);
         assert_eq!(batch.events.len(), 2);
         assert_eq!(batch.events[0].0, "0xuser1");
@@ -210,7 +214,7 @@ mod tests {
             round: Some(99999),
         };
 
-        let json = serde_json::to_string(&block).unwrap();
+        let json = sonic_rs::to_string(&block).unwrap();
         assert!(json.contains("\"height\":12345"));
         assert!(json.contains("\"blockTime\":1700000000000"));
         assert!(json.contains("\"numTxs\":10"));
@@ -228,7 +232,7 @@ mod tests {
             round: None,
         };
 
-        let json = serde_json::to_string(&block).unwrap();
+        let json = sonic_rs::to_string(&block).unwrap();
         assert!(!json.contains("round"));
     }
 
@@ -243,7 +247,7 @@ mod tests {
             error: None,
         };
 
-        let json = serde_json::to_string(&tx).unwrap();
+        let json = sonic_rs::to_string(&tx).unwrap();
         assert!(json.contains("\"user\":\"0xuser123\""));
         assert!(json.contains("\"block\":12345"));
     }

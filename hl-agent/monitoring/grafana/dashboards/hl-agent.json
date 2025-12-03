@@ -781,22 +781,22 @@
       "pluginVersion": "8.0.0",
       "targets": [
         {
-          "expr": "hl_agent:parse_duration_seconds:p50:idle_safe{parser_type=\"transactions\"}",
+          "expr": "hl_agent:parse_duration_seconds:p50:idle_safe{parser_type=\"replica_cmds\"}",
           "legendFormat": "p50",
           "refId": "A"
         },
         {
-          "expr": "hl_agent:parse_duration_seconds:p95:idle_safe{parser_type=\"transactions\"}",
+          "expr": "hl_agent:parse_duration_seconds:p95:idle_safe{parser_type=\"replica_cmds\"}",
           "legendFormat": "p95",
           "refId": "B"
         },
         {
-          "expr": "hl_agent:parse_duration_seconds:p99:idle_safe{parser_type=\"transactions\"}",
+          "expr": "hl_agent:parse_duration_seconds:p99:idle_safe{parser_type=\"replica_cmds\"}",
           "legendFormat": "p99",
           "refId": "C"
         }
       ],
-      "title": "Transactions Parse Duration (p50/p95/p99)",
+      "title": "Blocks + Transactions Parse Duration (replica_cmds)",
       "type": "timeseries"
     },
     {
@@ -864,22 +864,22 @@
       "pluginVersion": "8.0.0",
       "targets": [
         {
-          "expr": "hl_agent:parse_duration_seconds:p50:idle_safe{parser_type=\"blocks\"}",
+          "expr": "hl_agent:parse_duration_seconds:p50:idle_safe{parser_type=\"replica_cmds\"}",
           "legendFormat": "p50",
           "refId": "A"
         },
         {
-          "expr": "hl_agent:parse_duration_seconds:p95:idle_safe{parser_type=\"blocks\"}",
+          "expr": "hl_agent:parse_duration_seconds:p95:idle_safe{parser_type=\"replica_cmds\"}",
           "legendFormat": "p95",
           "refId": "B"
         },
         {
-          "expr": "hl_agent:parse_duration_seconds:p99:idle_safe{parser_type=\"blocks\"}",
+          "expr": "hl_agent:parse_duration_seconds:p99:idle_safe{parser_type=\"replica_cmds\"}",
           "legendFormat": "p99",
           "refId": "C"
         }
       ],
-      "title": "Blocks Parse Duration (p50/p95/p99)",
+      "title": "Blocks + Transactions Parse Duration (replica_cmds mirror)",
       "type": "timeseries"
     },
     {
@@ -1212,6 +1212,84 @@
         }
       ],
       "title": "Misc Events Parse Duration (p50/p95/p99)",
+      "type": "timeseries"
+    },
+    {
+      "datasource": "Prometheus",
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "axisLabel": "",
+            "axisPlacement": "auto",
+            "barAlignment": 0,
+            "drawStyle": "line",
+            "fillOpacity": 10,
+            "gradientMode": "none",
+            "hideFrom": {
+              "tooltip": false,
+              "viz": false,
+              "legend": false
+            },
+            "lineInterpolation": "linear",
+            "lineWidth": 1,
+            "pointSize": 5,
+            "scaleDistribution": {
+              "type": "linear"
+            },
+            "showPoints": "never",
+            "spanNulls": true
+          },
+          "mappings": [],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              }
+            ]
+          },
+          "unit": "ms"
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 24,
+        "x": 0,
+        "y": 46
+      },
+      "id": 21,
+      "options": {
+        "legend": {
+          "calcs": [
+            "mean",
+            "lastNotNull"
+          ],
+          "displayMode": "table",
+          "placement": "bottom"
+        },
+        "tooltip": {
+          "mode": "multi"
+        }
+      },
+      "pluginVersion": "8.0.0",
+      "targets": [
+        {
+          "expr": "1000 * histogram_quantile(0.50, sum by(parser_type, le) (rate(hl_agent_end_to_end_latency_seconds_bucket[2m])))",
+          "legendFormat": "{{parser_type}} p50",
+          "refId": "A"
+        },
+        {
+          "expr": "1000 * histogram_quantile(0.99, sum by(parser_type, le) (rate(hl_agent_end_to_end_latency_seconds_bucket[2m])))",
+          "legendFormat": "{{parser_type}} p99",
+          "refId": "B"
+        }
+      ],
+      "title": "End-to-End Latency (P50/P99)",
       "type": "timeseries"
     },
     {

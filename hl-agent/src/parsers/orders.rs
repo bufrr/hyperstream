@@ -6,7 +6,7 @@ use crate::parsers::{
 use crate::sorter_client::proto::DataRecord;
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
-use serde_json::Value;
+use sonic_rs::{JsonContainerTrait, JsonValueTrait, Value};
 use std::path::Path;
 use tracing::warn;
 
@@ -70,7 +70,7 @@ impl LineParser for OrdersLineParser {
     fn parse_line(&mut self, _file_path: &Path, line: &[u8]) -> Result<Vec<DataRecord>> {
         let mut records = Vec::new();
 
-        if let Ok(batch) = serde_json::from_slice::<BatchEnvelope<NodeOrderStatus>>(line) {
+        if let Ok(batch) = sonic_rs::from_slice::<BatchEnvelope<NodeOrderStatus>>(line) {
             let block_number = batch.block_number;
             for event in batch.events {
                 records.push(order_status_to_record(
@@ -82,7 +82,7 @@ impl LineParser for OrdersLineParser {
             return Ok(records);
         }
 
-        match serde_json::from_slice::<NodeOrderStatus>(line) {
+        match sonic_rs::from_slice::<NodeOrderStatus>(line) {
             Ok(event) => {
                 records.push(order_status_to_record(event, None, None)?);
             }
@@ -137,7 +137,7 @@ fn order_status_to_record(
         user: user.clone(),
         hash: hash.clone(),
         builder,
-        time: timestamp,  // Now using milliseconds instead of ISO8601 string
+        time: timestamp, // Now using milliseconds instead of ISO8601 string
         status: Some(status.clone()),
         coin: flattened_order.coin.clone(),
         side: flattened_order.side.clone(),
@@ -147,7 +147,7 @@ fn order_status_to_record(
     };
 
     let payload =
-        serde_json::to_vec(&order_record).context("failed to encode order payload to JSON")?;
+        sonic_rs::to_vec(&order_record).context("failed to encode order payload to JSON")?;
 
     Ok(DataRecord {
         block_height,
@@ -161,39 +161,44 @@ fn order_status_to_record(
 fn extract_order_fields(status: &Value) -> OrderFieldValues {
     let order_object = status
         .as_object()
-        .and_then(|obj| obj.get("order").and_then(Value::as_object))
+        .and_then(|obj| {
+            obj.get(&"order".to_string())
+                .and_then(|value| value.as_object())
+        })
         .or_else(|| status.as_object());
 
     let mut values = OrderFieldValues::default();
     if let Some(order) = order_object {
-        values.coin = order.get("coin").and_then(value_to_string);
-        values.side = order.get("side").and_then(value_to_string);
+        values.coin = order.get(&"coin".to_string()).and_then(value_to_string);
+        values.side = order.get(&"side".to_string()).and_then(value_to_string);
         values.limit_px = order
-            .get("limitPx")
-            .or_else(|| order.get("limit_px"))
+            .get(&"limitPx".to_string())
+            .or_else(|| order.get(&"limit_px".to_string()))
             .and_then(value_to_string);
-        values.sz = order.get("sz").and_then(value_to_string);
-        values.oid = order.get("oid").cloned();
+        values.sz = order.get(&"sz".to_string()).and_then(value_to_string);
+        values.oid = order.get(&"oid".to_string()).cloned();
     }
     values
 }
 
 fn value_to_string(value: &Value) -> Option<String> {
-    match value {
-        Value::String(s) => {
-            if s.trim().is_empty() {
-                None
-            } else {
-                Some(s.to_string())
-            }
+    if let Some(s) = value.as_str() {
+        let trimmed = s.trim();
+        if trimmed.is_empty() {
+            None
+        } else {
+            Some(trimmed.to_string())
         }
-        Value::Number(num) => num
-            .as_u64()
-            .map(|value| value.to_string())
-            .or_else(|| num.as_i64().map(|value| value.to_string()))
-            .or_else(|| num.as_f64().map(|value| value.to_string())),
-        Value::Bool(b) => Some(b.to_string()),
-        _ => None,
+    } else if let Some(num) = value.as_u64() {
+        Some(num.to_string())
+    } else if let Some(num) = value.as_i64() {
+        Some(num.to_string())
+    } else if let Some(num) = value.as_f64() {
+        Some(num.to_string())
+    } else if let Some(b) = value.as_bool() {
+        Some(b.to_string())
+    } else {
+        None
     }
 }
 
@@ -221,8 +226,7 @@ mod tests {
         }
         "#;
 
-        let batch: BatchEnvelope<NodeOrderStatus> =
-            serde_json::from_str(json).expect("should parse");
+        let batch: BatchEnvelope<NodeOrderStatus> = sonic_rs::from_str(json).expect("should parse");
         assert_eq!(batch.events.len(), 1);
         assert_eq!(batch.events[0].user, "alice");
     }
