@@ -40,10 +40,10 @@
         "overrides": []
       },
       "gridPos": {
-        "h": 6,
-        "w": 6,
         "x": 0,
-        "y": 0
+        "y": 0,
+        "w": 8,
+        "h": 8
       },
       "id": 1,
       "options": {
@@ -118,10 +118,10 @@
         "overrides": []
       },
       "gridPos": {
-        "h": 6,
-        "w": 6,
-        "x": 6,
-        "y": 0
+        "x": 8,
+        "y": 0,
+        "w": 8,
+        "h": 8
       },
       "id": 2,
       "options": {
@@ -191,10 +191,10 @@
         "overrides": []
       },
       "gridPos": {
-        "h": 0,
-        "w": 6,
-        "x": 12,
-        "y": 1000
+        "x": 8,
+        "y": 47,
+        "w": 8,
+        "h": 7
       },
       "id": 3,
       "options": {
@@ -218,9 +218,9 @@
           "refId": "A"
         }
       ],
-      "title": "Redis Cache Hit Rate (deprecated)",
+      "title": "Redis Cache Hit Rate",
       "type": "timeseries",
-      "description": "\n\nNote: Block hash enrichment was removed for performance (parse latency: 20-30ms \u2192 2-6ms). This metric will show no data."
+      "description": "Note: Currently shows no data. Block hash enrichment was temporarily disabled for performance (parse latency: 20-30ms \u2192 1-4ms). These metrics will be restored when async hash enrichment is implemented."
     },
     {
       "datasource": "Prometheus",
@@ -248,10 +248,10 @@
         "overrides": []
       },
       "gridPos": {
-        "h": 0,
-        "w": 6,
-        "x": 18,
-        "y": 1000
+        "x": 16,
+        "y": 47,
+        "w": 8,
+        "h": 7
       },
       "id": 4,
       "options": {
@@ -276,9 +276,9 @@
           "refId": "A"
         }
       ],
-      "title": "Block Validation Failures (Total) (deprecated)",
+      "title": "Block Validation Failures (Total)",
       "type": "stat",
-      "description": "\n\nNote: Block hash enrichment was removed for performance (parse latency: 20-30ms \u2192 2-6ms). This metric will show no data."
+      "description": "Note: Currently shows no data. Block hash enrichment was temporarily disabled for performance (parse latency: 20-30ms \u2192 1-4ms). These metrics will be restored when async hash enrichment is implemented."
     },
     {
       "datasource": "Prometheus",
@@ -323,10 +323,10 @@
         "overrides": []
       },
       "gridPos": {
-        "h": 8,
-        "w": 8,
         "x": 0,
-        "y": 6
+        "y": 9,
+        "w": 8,
+        "h": 7
       },
       "id": 5,
       "options": {
@@ -396,10 +396,10 @@
         "overrides": []
       },
       "gridPos": {
-        "h": 8,
-        "w": 8,
         "x": 8,
-        "y": 6
+        "y": 9,
+        "w": 8,
+        "h": 7
       },
       "id": 6,
       "options": {
@@ -469,10 +469,10 @@
         "overrides": []
       },
       "gridPos": {
-        "h": 8,
-        "w": 8,
         "x": 16,
-        "y": 6
+        "y": 9,
+        "w": 8,
+        "h": 7
       },
       "id": 7,
       "options": {
@@ -542,10 +542,10 @@
         "overrides": []
       },
       "gridPos": {
-        "h": 8,
-        "w": 8,
         "x": 0,
-        "y": 14
+        "y": 16,
+        "w": 8,
+        "h": 7
       },
       "id": 8,
       "options": {
@@ -615,10 +615,10 @@
         "overrides": []
       },
       "gridPos": {
-        "h": 8,
-        "w": 8,
         "x": 8,
-        "y": 14
+        "y": 16,
+        "w": 8,
+        "h": 7
       },
       "id": 9,
       "options": {
@@ -688,10 +688,10 @@
         "overrides": []
       },
       "gridPos": {
-        "h": 8,
-        "w": 8,
         "x": 16,
-        "y": 14
+        "y": 16,
+        "w": 8,
+        "h": 7
       },
       "id": 10,
       "options": {
@@ -761,10 +761,10 @@
         "overrides": []
       },
       "gridPos": {
-        "h": 8,
-        "w": 8,
         "x": 0,
-        "y": 22
+        "y": 24,
+        "w": 9,
+        "h": 7
       },
       "id": 11,
       "options": {
@@ -844,10 +844,10 @@
         "overrides": []
       },
       "gridPos": {
-        "h": 8,
-        "w": 8,
-        "x": 16,
-        "y": 22
+        "x": 9,
+        "y": 24,
+        "w": 6,
+        "h": 7
       },
       "id": 13,
       "options": {
@@ -927,10 +927,10 @@
         "overrides": []
       },
       "gridPos": {
-        "h": 8,
-        "w": 8,
-        "x": 0,
-        "y": 30
+        "x": 15,
+        "y": 24,
+        "w": 4,
+        "h": 7
       },
       "id": 14,
       "options": {
@@ -1010,10 +1010,10 @@
         "overrides": []
       },
       "gridPos": {
-        "h": 8,
-        "w": 8,
-        "x": 8,
-        "y": 30
+        "x": 19,
+        "y": 24,
+        "w": 5,
+        "h": 7
       },
       "id": 15,
       "options": {
@@ -1093,10 +1093,10 @@
         "overrides": []
       },
       "gridPos": {
-        "h": 8,
+        "x": 0,
+        "y": 31,
         "w": 8,
-        "x": 16,
-        "y": 30
+        "h": 7
       },
       "id": 16,
       "options": {
@@ -1176,10 +1176,10 @@
         "overrides": []
       },
       "gridPos": {
-        "h": 8,
-        "w": 24,
-        "x": 0,
-        "y": 46
+        "x": 18,
+        "y": 39,
+        "w": 6,
+        "h": 7
       },
       "id": 21,
       "options": {
@@ -1242,10 +1242,10 @@
         "overrides": []
       },
       "gridPos": {
-        "h": 8,
-        "w": 8,
         "x": 0,
-        "y": 38
+        "y": 39,
+        "w": 6,
+        "h": 7
       },
       "id": 17,
       "options": {
@@ -1302,10 +1302,10 @@
         "overrides": []
       },
       "gridPos": {
-        "h": 8,
-        "w": 8,
-        "x": 8,
-        "y": 38
+        "x": 6,
+        "y": 39,
+        "w": 6,
+        "h": 7
       },
       "id": 18,
       "options": {
@@ -1374,10 +1374,10 @@
         "overrides": []
       },
       "gridPos": {
-        "h": 8,
-        "w": 8,
-        "x": 16,
-        "y": 38
+        "x": 12,
+        "y": 39,
+        "w": 6,
+        "h": 7
       },
       "id": 19,
       "options": {
@@ -1425,10 +1425,10 @@
         "overrides": []
       },
       "gridPos": {
-        "h": 4,
-        "w": 6,
-        "x": 0,
-        "y": 4
+        "x": 16,
+        "y": 0,
+        "w": 8,
+        "h": 8
       },
       "id": 20,
       "options": {
@@ -1497,10 +1497,10 @@
         }
       },
       "gridPos": {
-        "h": 0,
-        "w": 12,
-        "x": 12,
-        "y": 1000
+        "x": 0,
+        "y": 47,
+        "w": 8,
+        "h": 7
       },
       "id": 30,
       "options": {
@@ -1528,9 +1528,57 @@
           "refId": "B"
         }
       ],
-      "title": "Block Merger Duration (deprecated - inline merging removed)",
+      "title": "Block Merger Duration",
       "type": "timeseries",
-      "description": "Block hash enrichment was removed for performance. Blocks are now emitted with empty hashes. This panel will show no data."
+      "description": "Note: Currently shows no data. Block hash enrichment was temporarily disabled for performance (parse latency: 20-30ms \u2192 1-4ms). These metrics will be restored when async hash enrichment is implemented."
+    },
+    {
+      "id": 1000,
+      "type": "row",
+      "title": "Data Records",
+      "collapsed": false,
+      "gridPos": {
+        "x": 0,
+        "y": 8,
+        "w": 24,
+        "h": 1
+      }
+    },
+    {
+      "id": 1001,
+      "type": "row",
+      "title": "Parser Performance",
+      "collapsed": false,
+      "gridPos": {
+        "x": 0,
+        "y": 23,
+        "w": 24,
+        "h": 1
+      }
+    },
+    {
+      "id": 1002,
+      "type": "row",
+      "title": "System Performance",
+      "collapsed": false,
+      "gridPos": {
+        "x": 0,
+        "y": 38,
+        "w": 24,
+        "h": 1
+      }
+    },
+    {
+      "id": 1003,
+      "type": "row",
+      "title": "Block Hash Enrichment (Inactive)",
+      "collapsed": false,
+      "gridPos": {
+        "x": 0,
+        "y": 46,
+        "w": 24,
+        "h": 1
+      }
     }
   ],
   "refresh": "10s",
