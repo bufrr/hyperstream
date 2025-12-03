@@ -218,8 +218,9 @@
           "refId": "A"
         }
       ],
-      "title": "Redis Cache Hit Rate",
-      "type": "timeseries"
+      "title": "Redis Cache Hit Rate (deprecated)",
+      "type": "timeseries",
+      "description": "\n\nNote: Block hash enrichment was removed for performance (parse latency: 20-30ms \u2192 2-6ms). This metric will show no data."
     },
     {
       "datasource": "Prometheus",
@@ -275,8 +276,9 @@
           "refId": "A"
         }
       ],
-      "title": "Block Validation Failures (Total)",
-      "type": "stat"
+      "title": "Block Validation Failures (Total) (deprecated)",
+      "type": "stat",
+      "description": "\n\nNote: Block hash enrichment was removed for performance (parse latency: 20-30ms \u2192 2-6ms). This metric will show no data."
     },
     {
       "datasource": "Prometheus",
@@ -1526,8 +1528,9 @@
           "refId": "B"
         }
       ],
-      "title": "Block Merger Duration by Stage (P50/P99)",
-      "type": "timeseries"
+      "title": "Block Merger Duration (deprecated - inline merging removed)",
+      "type": "timeseries",
+      "description": "Block hash enrichment was removed for performance. Blocks are now emitted with empty hashes. This panel will show no data."
     }
   ],
   "refresh": "10s",
