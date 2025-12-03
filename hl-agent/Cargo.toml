@@ -17,7 +17,7 @@ path = "src/bin/ws_agent.rs"
 
 [dependencies]
 anyhow = "1"
-notify = "8"
+walkdir = "2"
 prost = "0.14"
 rusqlite = { version = "0.37", features = ["bundled"] }
 serde = { version = "1", features = ["derive"] }
@@ -46,9 +46,9 @@ hyper = { version = "1", features = ["server", "http1"] }
 hyper-util = { version = "0.1", features = ["tokio"] }
 http-body-util = "0.1"
 reqwest = { version = "0.12", features = ["json"] }
+chrono = "0.4"
 
 [dev-dependencies]
-chrono = "0.4"
 
 [build-dependencies]
 tonic-prost-build = "0.14"
