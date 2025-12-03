@@ -29,16 +29,16 @@
           "thresholds": {
             "mode": "absolute",
             "steps": [
-          {
-            "color": "green",
-            "value": null
-          }
-        ]
+              {
+                "color": "green",
+                "value": null
+              }
+            ]
+          },
+          "unit": "short"
+        },
+        "overrides": []
       },
-      "unit": "short"
-    },
-    "overrides": []
-  },
       "gridPos": {
         "h": 6,
         "w": 6,
@@ -107,16 +107,16 @@
           "thresholds": {
             "mode": "absolute",
             "steps": [
-          {
-            "color": "green",
-            "value": null
-          }
-        ]
+              {
+                "color": "green",
+                "value": null
+              }
+            ]
+          },
+          "unit": "none"
+        },
+        "overrides": []
       },
-      "unit": "none"
-    },
-    "overrides": []
-  },
       "gridPos": {
         "h": 6,
         "w": 6,
@@ -844,89 +844,6 @@
       "gridPos": {
         "h": 8,
         "w": 8,
-        "x": 8,
-        "y": 22
-      },
-      "id": 12,
-      "options": {
-        "legend": {
-          "calcs": [
-            "mean",
-            "lastNotNull"
-          ],
-          "displayMode": "table",
-          "placement": "bottom"
-        },
-        "tooltip": {
-          "mode": "multi"
-        }
-      },
-      "pluginVersion": "8.0.0",
-      "targets": [
-        {
-          "expr": "hl_agent:parse_duration_seconds:p50:idle_safe{parser_type=\"replica_cmds\"}",
-          "legendFormat": "p50",
-          "refId": "A"
-        },
-        {
-          "expr": "hl_agent:parse_duration_seconds:p95:idle_safe{parser_type=\"replica_cmds\"}",
-          "legendFormat": "p95",
-          "refId": "B"
-        },
-        {
-          "expr": "hl_agent:parse_duration_seconds:p99:idle_safe{parser_type=\"replica_cmds\"}",
-          "legendFormat": "p99",
-          "refId": "C"
-        }
-      ],
-      "title": "Blocks + Transactions Parse Duration (replica_cmds mirror)",
-      "type": "timeseries"
-    },
-    {
-      "datasource": "Prometheus",
-      "fieldConfig": {
-        "defaults": {
-          "color": {
-            "mode": "palette-classic"
-          },
-          "custom": {
-            "axisLabel": "",
-            "axisPlacement": "auto",
-            "barAlignment": 0,
-            "drawStyle": "line",
-            "fillOpacity": 10,
-            "gradientMode": "none",
-            "hideFrom": {
-              "tooltip": false,
-              "viz": false,
-              "legend": false
-            },
-            "lineInterpolation": "linear",
-            "lineWidth": 1,
-            "pointSize": 5,
-            "scaleDistribution": {
-              "type": "linear"
-            },
-            "showPoints": "never",
-            "spanNulls": true
-          },
-          "mappings": [],
-          "thresholds": {
-            "mode": "absolute",
-            "steps": [
-              {
-                "color": "green",
-                "value": null
-              }
-            ]
-          },
-          "unit": "s"
-        },
-        "overrides": []
-      },
-      "gridPos": {
-        "h": 8,
-        "w": 8,
         "x": 16,
         "y": 22
       },
@@ -1476,12 +1393,12 @@
       "pluginVersion": "8.0.0",
       "targets": [
         {
-          "expr": "sum by (parser_type, error_type) (rate(hl_agent_parse_errors_total[5m])) or on() label_replace(label_replace(vector(0), \"parser_type\", \"all\", \"\", \"\"), \"error_type\", \"none\", \"\", \"\")",
+          "expr": "sum by (parser_type, error_type) (hl_agent_parse_errors_total) or on() label_replace(label_replace(vector(0), \"parser_type\", \"all\", \"\", \"\"), \"error_type\", \"none\", \"\", \"\")",
           "legendFormat": "{{parser_type}}: {{error_type}}",
           "refId": "A"
         }
       ],
-      "title": "Parse Errors (per second)",
+      "title": "Parse Errors (Total)",
       "type": "timeseries"
     },
     {
@@ -1535,6 +1452,82 @@
       ],
       "title": "Latest Block Height",
       "type": "stat"
+    },
+    {
+      "datasource": "Prometheus",
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "axisLabel": "Duration (seconds)",
+            "axisPlacement": "auto",
+            "barAlignment": 0,
+            "drawStyle": "line",
+            "fillOpacity": 10,
+            "gradientMode": "none",
+            "hideFrom": {
+              "tooltip": false,
+              "viz": false,
+              "legend": false
+            },
+            "lineInterpolation": "linear",
+            "lineWidth": 2,
+            "pointSize": 5,
+            "scaleDistribution": {
+              "type": "linear"
+            },
+            "showPoints": "never",
+            "spanNulls": true
+          },
+          "mappings": [],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              }
+            ]
+          },
+          "unit": "s"
+        }
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 12,
+        "y": 24
+      },
+      "id": 30,
+      "options": {
+        "legend": {
+          "calcs": [
+            "mean",
+            "max"
+          ],
+          "displayMode": "table",
+          "placement": "bottom"
+        },
+        "tooltip": {
+          "mode": "multi"
+        }
+      },
+      "targets": [
+        {
+          "expr": "histogram_quantile(0.50, sum(rate(hl_agent_block_merger_duration_seconds_bucket[2m])) by (le, stage))",
+          "legendFormat": "{{stage}} P50",
+          "refId": "A"
+        },
+        {
+          "expr": "histogram_quantile(0.99, sum(rate(hl_agent_block_merger_duration_seconds_bucket[2m])) by (le, stage))",
+          "legendFormat": "{{stage}} P99",
+          "refId": "B"
+        }
+      ],
+      "title": "Block Merger Duration by Stage (P50/P99)",
+      "type": "timeseries"
     }
   ],
   "refresh": "10s",
