@@ -289,24 +289,24 @@ impl ReplicaCmdsParser {
                 round,
             };
 
-            // Process block through merger (looks up hash, validates, returns merged block)
-            if let Some(merged) = self.merger.process_file_block_blocking(block_data) {
-                match merged.to_data_record() {
-                    Ok(data_record) => {
-                        // Update latest block height gauge metric
-                        LATEST_BLOCK_HEIGHT.set(block_height as i64);
-                        records.push(data_record);
-                    }
-                    Err(err) => {
-                        warn!(
-                            error = %err,
-                            height = block_height,
-                            "failed to convert merged block to data record"
-                        );
-                    }
+            // Convert to merged block without hash lookup (consistent with BlocksParser)
+            let merged =
+                crate::parsers::block_merger::MergedBlock::from_replica_data(block_data, None);
+
+            match merged.to_data_record() {
+                Ok(data_record) => {
+                    // Update latest block height gauge metric
+                    LATEST_BLOCK_HEIGHT.set(block_height as i64);
+                    records.push(data_record);
+                }
+                Err(err) => {
+                    warn!(
+                        error = %err,
+                        height = block_height,
+                        "failed to convert merged block to data record"
+                    );
                 }
             }
-            // If None, block was dropped due to validation failure (already warned in merger)
         }
 
         // --- Process TRANSACTION data ---
