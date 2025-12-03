@@ -16,6 +16,7 @@ pub enum FileEvent {
     Closed(PathBuf),
 }
 
+pub const FILE_RECENCY_WINDOW: Duration = Duration::from_secs(60 * 60);
 pub const WATCHER_CHANNEL_CAPACITY: usize = 1000;
 const IDLE_TIMEOUT: Duration = Duration::from_secs(5 * 60);
 const IDLE_CHECK_INTERVAL: Duration = Duration::from_secs(30);
@@ -25,6 +26,7 @@ struct ScanStats {
     dirs_scanned: usize,
     files_found: usize,
     directories_discovered: usize,
+    old_files_skipped: usize,
 }
 
 pub async fn watch_directories(
@@ -77,6 +79,7 @@ pub async fn watch_directories(
                     dirs_scanned = scan_stats.dirs_scanned,
                     files_found = scan_stats.files_found,
                     directories_discovered = scan_stats.directories_discovered,
+                    old_files_skipped = scan_stats.old_files_skipped,
                     "proactive scan completed"
                 );
                 if scan_stats.files_found == 0 {
@@ -133,10 +136,23 @@ fn scan_directory_recursive(
             let mut event = None;
 
             if seen_files.insert(path_buf.clone()) {
-                log_file_detection(path, "scan_created");
                 if let Some(mod_time) = modified_time {
+                    if let Ok(age) = SystemTime::now().duration_since(mod_time) {
+                        if age > FILE_RECENCY_WINDOW {
+                            debug!(
+                                path = %path.display(),
+                                age_seconds = age.as_secs(),
+                                window_seconds = FILE_RECENCY_WINDOW.as_secs(),
+                                "skipping old file outside recency window"
+                            );
+                            scan_stats.old_files_skipped += 1;
+                            file_mod_times.insert(path_buf.clone(), mod_time);
+                            continue;
+                        }
+                    }
                     file_mod_times.insert(path_buf.clone(), mod_time);
                 }
+                log_file_detection(path, "scan_created");
                 event = Some(FileEvent::Created(path_buf));
             } else if let (Some(mod_time), Some(previous)) = (modified_time, file_mod_times.get(&path_buf)) {
                 if mod_time > *previous {
