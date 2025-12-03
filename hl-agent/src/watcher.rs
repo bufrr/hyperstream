@@ -34,6 +34,7 @@ pub async fn watch_directories(
     poll_interval: Duration,
     event_tx: mpsc::Sender<FileEvent>,
     cancel_token: CancellationToken,
+    skip_historical: bool,
 ) -> Result<()> {
     let mut seen_files: HashSet<PathBuf> = HashSet::new();
     let mut seen_dirs: HashSet<PathBuf> = HashSet::new();
@@ -46,6 +47,7 @@ pub async fn watch_directories(
     let mut idle_check_interval = interval(IDLE_CHECK_INTERVAL);
     scan_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     idle_check_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    let mut first_scan = true;
 
     info!(
         count = watch_paths.len(),
@@ -64,9 +66,9 @@ pub async fn watch_directories(
                 seen_dirs.retain(|path| path.exists());
                 file_mod_times.retain(|path, _| path.exists());
                 let mut scan_stats = ScanStats::default();
-                for watch_path in &watch_paths {
-                    scan_directory_recursive(
-                        watch_path,
+                if first_scan && skip_historical {
+                    initial_skip_historical_scan(
+                        &watch_paths,
                         &event_tx,
                         &mut seen_files,
                         &mut seen_dirs,
@@ -74,7 +76,20 @@ pub async fn watch_directories(
                         &mut file_activity,
                         &mut scan_stats,
                     );
+                } else {
+                    for watch_path in &watch_paths {
+                        scan_directory_recursive(
+                            watch_path,
+                            &event_tx,
+                            &mut seen_files,
+                            &mut seen_dirs,
+                            &mut file_mod_times,
+                            &mut file_activity,
+                            &mut scan_stats,
+                        );
+                    }
                 }
+                first_scan = false;
                 info!(
                     dirs_scanned = scan_stats.dirs_scanned,
                     files_found = scan_stats.files_found,
@@ -96,6 +111,73 @@ pub async fn watch_directories(
     }
 
     Ok(())
+}
+
+fn initial_skip_historical_scan(
+    watch_paths: &[PathBuf],
+    event_tx: &mpsc::Sender<FileEvent>,
+    seen_files: &mut HashSet<PathBuf>,
+    seen_dirs: &mut HashSet<PathBuf>,
+    file_mod_times: &mut HashMap<PathBuf, SystemTime>,
+    file_activity: &mut HashMap<PathBuf, Instant>,
+    scan_stats: &mut ScanStats,
+) {
+    for watch_path in watch_paths {
+        trace!(path = %watch_path.display(), "scanning directory (skip_historical)");
+        let mut latest_file: Option<(PathBuf, SystemTime)> = None;
+        let mut fallback_latest: Option<PathBuf> = None;
+
+        for entry in WalkDir::new(watch_path).into_iter().filter_map(|e| e.ok()) {
+            let path = entry.path();
+            if entry.file_type().is_dir() {
+                scan_stats.dirs_scanned += 1;
+                if seen_dirs.insert(path.to_path_buf()) {
+                    scan_stats.directories_discovered += 1;
+                    info!(path = %path.display(), "discovered new directory during scan");
+                }
+                continue;
+            }
+
+            if entry.file_type().is_file() {
+                scan_stats.files_found += 1;
+                let metadata = match entry.metadata() {
+                    Ok(metadata) => metadata,
+                    Err(err) => {
+                        debug!(path = %path.display(), error = %err, "failed to read metadata during scan");
+                        continue;
+                    }
+                };
+
+                let modified_time = metadata.modified().ok();
+                let path_buf = path.to_path_buf();
+                seen_files.insert(path_buf.clone());
+
+                if let Some(mod_time) = modified_time {
+                    if latest_file
+                        .as_ref()
+                        .map(|(_, t)| mod_time > *t)
+                        .unwrap_or(true)
+                    {
+                        latest_file = Some((path_buf.clone(), mod_time));
+                    }
+                    file_mod_times.insert(path_buf, mod_time);
+                } else {
+                    fallback_latest.get_or_insert(path_buf);
+                }
+            }
+        }
+
+        if let Some(path) = latest_file
+            .map(|(path, _)| path)
+            .or_else(|| fallback_latest.clone())
+        {
+            info!(path = %path.display(), "skip_historical: starting with latest file");
+            log_file_detection(&path, "scan_created");
+            let event = FileEvent::Created(path.clone());
+            record_activity(&event, file_activity);
+            send_event(event_tx, event, "scan");
+        }
+    }
 }
 
 fn scan_directory_recursive(
@@ -154,7 +236,9 @@ fn scan_directory_recursive(
                 }
                 log_file_detection(path, "scan_created");
                 event = Some(FileEvent::Created(path_buf));
-            } else if let (Some(mod_time), Some(previous)) = (modified_time, file_mod_times.get(&path_buf)) {
+            } else if let (Some(mod_time), Some(previous)) =
+                (modified_time, file_mod_times.get(&path_buf))
+            {
                 if mod_time > *previous {
                     file_mod_times.insert(path_buf.clone(), mod_time);
                     log_file_detection(path, "scan_modified");
@@ -183,7 +267,10 @@ fn record_activity(event: &FileEvent, file_activity: &mut HashMap<PathBuf, Insta
     }
 }
 
-fn close_idle_files(file_activity: &mut HashMap<PathBuf, Instant>, event_tx: &mpsc::Sender<FileEvent>) {
+fn close_idle_files(
+    file_activity: &mut HashMap<PathBuf, Instant>,
+    event_tx: &mpsc::Sender<FileEvent>,
+) {
     let now = Instant::now();
     let mut stale_paths = Vec::new();
 

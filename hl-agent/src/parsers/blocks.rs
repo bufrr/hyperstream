@@ -136,10 +136,11 @@ impl crate::parsers::Parser for BlocksParser {
 
                         // Convert to ReplicaBlockData and emit without hash (merging deferred)
                         if let Some(replica_data) = self.abci_block_to_replica_data(block, height) {
-                            let merged = crate::parsers::block_merger::MergedBlock::from_replica_data(
-                                replica_data,
-                                None,
-                            );
+                            let merged =
+                                crate::parsers::block_merger::MergedBlock::from_replica_data(
+                                    replica_data,
+                                    None,
+                                );
 
                             match merged.to_data_record() {
                                 Ok(data_record) => {

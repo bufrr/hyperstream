@@ -183,13 +183,15 @@ impl BlockMerger {
             Self::observe_duration(&metric_label, last_duration);
 
             let parsed = match response {
-                Ok(resp) if resp.status().is_success() => match resp.json::<ExplorerBlockResponse>().await {
-                    Ok(explorer_data) => Some(explorer_data),
-                    Err(err) => {
-                        warn!(height, attempt = attempt + 1, %err, "Failed to parse Explorer API response");
-                        None
+                Ok(resp) if resp.status().is_success() => {
+                    match resp.json::<ExplorerBlockResponse>().await {
+                        Ok(explorer_data) => Some(explorer_data),
+                        Err(err) => {
+                            warn!(height, attempt = attempt + 1, %err, "Failed to parse Explorer API response");
+                            None
+                        }
                     }
-                },
+                }
                 Ok(resp) => {
                     warn!(
                         height,
@@ -206,9 +208,11 @@ impl BlockMerger {
             };
 
             if let Some(explorer_data) = parsed {
-                if let (Some(hash), Some(block_time), Some(proposer)) =
-                    (explorer_data.hash, explorer_data.block_time, explorer_data.proposer)
-                {
+                if let (Some(hash), Some(block_time), Some(proposer)) = (
+                    explorer_data.hash,
+                    explorer_data.block_time,
+                    explorer_data.proposer,
+                ) {
                     Self::observe_duration("lookup.explorer_success", last_duration);
                     Self::inc_explorer_fallback("success");
 
@@ -432,10 +436,7 @@ mod tests {
             .expect("block should be emitted");
         assert_eq!(miss.hash, "");
 
-        store.cache_insert_for_test(
-            400,
-            redis_data(1_800_000_000_000, "proposer", "0xfeedface"),
-        );
+        store.cache_insert_for_test(400, redis_data(1_800_000_000_000, "proposer", "0xfeedface"));
 
         assert!(
             merger.process_file_block(sample_block(400)).await.is_none(),
@@ -459,5 +460,4 @@ mod tests {
             .expect("block should be emitted");
         assert_eq!(merged.hash, "0xdeadbeef");
     }
-
 }

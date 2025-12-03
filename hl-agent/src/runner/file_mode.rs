@@ -93,9 +93,17 @@ impl FileRunner {
         let paths = self.watch_paths.clone();
         let event_tx = self.event_tx.clone();
         let cancel_token = self.cancel_token.clone();
+        let skip_historical = self.skip_historical;
 
         self.watcher_handle = Some(tokio::spawn(async move {
-            if let Err(err) = watch_directories(paths, poll_interval, event_tx, cancel_token).await
+            if let Err(err) = watch_directories(
+                paths,
+                poll_interval,
+                event_tx,
+                cancel_token,
+                skip_historical,
+            )
+            .await
             {
                 error!(error = %err, "file watcher exited unexpectedly");
             }
