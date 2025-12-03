@@ -1279,13 +1279,13 @@
       "pluginVersion": "8.0.0",
       "targets": [
         {
-          "expr": "1000 * histogram_quantile(0.50, sum by(parser_type, le) (rate(hl_agent_end_to_end_latency_seconds_bucket[2m])))",
-          "legendFormat": "{{parser_type}} p50",
+          "expr": "1000 * histogram_quantile(0.50, sum(rate(hl_agent_end_to_end_latency_seconds_bucket[2m])) by (le))",
+          "legendFormat": "p50",
           "refId": "A"
         },
         {
-          "expr": "1000 * histogram_quantile(0.99, sum by(parser_type, le) (rate(hl_agent_end_to_end_latency_seconds_bucket[2m])))",
-          "legendFormat": "{{parser_type}} p99",
+          "expr": "1000 * histogram_quantile(0.99, sum(rate(hl_agent_end_to_end_latency_seconds_bucket[2m])) by (le))",
+          "legendFormat": "p99",
           "refId": "B"
         }
       ],

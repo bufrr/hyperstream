@@ -2,10 +2,11 @@ use anyhow::{Context, Result};
 use notify::{
     Config as NotifyConfig, Event, EventKind, RecommendedWatcher, RecursiveMode, Watcher,
 };
+use std::collections::HashSet;
 use std::path::PathBuf;
 use std::time::Duration;
 use tokio::sync::mpsc::{self, error::TrySendError};
-use tokio::time::sleep;
+use tokio::time::interval;
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info, warn};
 
@@ -45,7 +46,14 @@ pub async fn watch_directories(
         "file watcher started for configured paths"
     );
 
-    // Keep the watcher alive for the lifetime of the process.
+    // Track seen files to detect newly created ones during scans
+    let mut seen_files: HashSet<PathBuf> = HashSet::new();
+
+    // Create periodic scanner that runs every poll_interval
+    let mut scan_interval = interval(poll_interval);
+    scan_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+
+    // Keep the watcher alive and periodically scan for new directories/files
     loop {
         tokio::select! {
             biased;
@@ -53,11 +61,49 @@ pub async fn watch_directories(
                 info!("file watcher received shutdown signal");
                 break;
             }
-            _ = sleep(Duration::from_secs(3600)) => {}
+            _ = scan_interval.tick() => {
+                // Remove files that disappeared to avoid unbounded growth
+                seen_files.retain(|path| path.exists());
+
+                // Proactively scan watch paths for new files
+                for watch_path in &watch_paths {
+                    scan_directory_recursive(&watch_path, &event_tx, &mut seen_files);
+                }
+            }
         }
     }
 
     Ok(())
+}
+
+/// Recursively scan a directory for new files and emit Created events
+fn scan_directory_recursive(
+    dir: &PathBuf,
+    event_tx: &mpsc::Sender<FileEvent>,
+    seen_files: &mut HashSet<PathBuf>,
+) {
+    let entries = match std::fs::read_dir(dir) {
+        Ok(entries) => entries,
+        Err(err) => {
+            debug!(path = %dir.display(), error = %err, "failed to read directory during scan");
+            return;
+        }
+    };
+
+    for entry in entries.flatten() {
+        let path = entry.path();
+
+        if path.is_dir() {
+            // Recursively scan subdirectories
+            scan_directory_recursive(&path, event_tx, seen_files);
+        } else if path.is_file() {
+            // Check if this is a new file we haven't seen before
+            if seen_files.insert(path.clone()) {
+                debug!(path = %path.display(), "proactive scan detected new file");
+                send_event(event_tx, FileEvent::Created(path), "scan_created");
+            }
+        }
+    }
 }
 
 fn handle_event(event_tx: &mpsc::Sender<FileEvent>, event: Event) {
