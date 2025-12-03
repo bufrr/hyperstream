@@ -10,7 +10,6 @@ use std::sync::{Arc, OnceLock};
 use tokio::sync::Mutex as AsyncMutex;
 use tracing::{debug, info, warn};
 
-/// Default in-memory cache size (~20k hashes)
 pub const DEFAULT_HASH_STORE_CACHE_SIZE: usize = 20_000;
 
 static GLOBAL_HASH_STORE: OnceLock<Arc<HashStore>> = OnceLock::new();
@@ -30,7 +29,6 @@ pub struct RedisBlockData {
     pub hash: String,
 }
 
-/// Outcome of a block data lookup.
 pub enum BlockLookupResult {
     /// Served from the in-memory cache.
     CacheHit(RedisBlockData),
@@ -135,6 +133,36 @@ impl HashStore {
                 BlockLookupResult::RedisMiss
             }
         }
+    }
+
+    /// Store block data in Redis and cache.
+    /// This is used when Explorer API fallback provides new block data.
+    pub async fn set_block_data(&self, height: u64, data: &RedisBlockData) -> Result<()> {
+        if self.cache_only_mode {
+            self.cache.write().put(height, data.clone());
+            return Ok(());
+        }
+
+        let conn_mutex = self
+            .redis_conn
+            .as_ref()
+            .ok_or_else(|| anyhow!("Redis connection not available"))?;
+
+        let key = format!("block:{height}");
+        let payload = sonic_rs::to_string(&serde_json::json!({
+            "hash": data.hash,
+            "blockTime": data.block_time,
+            "proposer": data.proposer,
+        }))
+        .context("failed to serialize block data")?;
+
+        let mut conn = conn_mutex.lock().await;
+        conn.set::<_, _, ()>(&key, payload)
+            .await
+            .with_context(|| format!("failed to write block data to Redis for height {height}"))?;
+
+        self.cache.write().put(height, data.clone());
+        Ok(())
     }
 
     pub fn global() -> Arc<HashStore> {
