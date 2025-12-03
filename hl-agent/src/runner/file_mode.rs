@@ -168,6 +168,11 @@ impl FileRunner {
     }
 
     async fn handle_file_event(&mut self, event: FileEvent) {
+        if let FileEvent::Closed(path) = event {
+            shutdown_tailer_for_path(&self.active_tailers, &self.file_activity, &path).await;
+            return;
+        }
+
         let (path, is_new_file) = event_details(&event);
         if let Err(err) = maybe_skip_historical_for_path(
             &path,
@@ -333,6 +338,7 @@ fn event_details(event: &FileEvent) -> (PathBuf, bool) {
     match event {
         FileEvent::Created(path) => (path.clone(), true),
         FileEvent::Modified(path) => (path.clone(), false),
+        FileEvent::Closed(path) => (path.clone(), false),
     }
 }
 
@@ -555,6 +561,40 @@ async fn spawn_tailer_if_needed(
             shutdown_tx,
         },
     );
+}
+
+async fn shutdown_tailer_for_path(
+    active_tailers: &Arc<Mutex<HashMap<PathBuf, TailerHandle>>>,
+    file_activity: &Arc<Mutex<HashMap<PathBuf, FileActivity>>>,
+    path: &PathBuf,
+) {
+    let handle = {
+        let mut tailers = active_tailers.lock().await;
+        tailers.remove(path)
+    };
+
+    let handle = match handle {
+        Some(handle) => handle,
+        None => {
+            debug!(path = %path.display(), "close event received but no active tailer found");
+            return;
+        }
+    };
+
+    file_activity.lock().await.remove(path);
+    match handle.shutdown_tx.try_send(()) {
+        Ok(_) => info!(path = %path.display(), "stopping tailer due to idle close event"),
+        Err(TrySendError::Full(_)) => {
+            debug!(path = %path.display(), "tailer shutdown already signaled");
+        }
+        Err(TrySendError::Closed(_)) => {
+            debug!(path = %path.display(), "tailer shutdown channel closed; tailer likely exiting");
+        }
+    }
+
+    if let Err(err) = handle.handle.await {
+        warn!(path = %path.display(), error = %err, "tailer task finished with error during idle shutdown");
+    }
 }
 
 async fn activity_monitor(
