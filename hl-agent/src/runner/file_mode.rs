@@ -388,10 +388,19 @@ async fn maybe_skip_historical_for_path(
         .as_secs() as i64;
     let file_size = metadata.len();
 
-    let is_recently_modified = SystemTime::now()
+    let now = SystemTime::now();
+    let is_recently_modified = now
         .duration_since(last_modified)
-        .map(|elapsed| elapsed <= Duration::from_secs(300))
+        .map(|elapsed| elapsed <= Duration::from_secs(60))
         .unwrap_or(false);
+    let is_recently_created = metadata
+        .created()
+        .ok()
+        .and_then(|created| now.duration_since(created).ok())
+        .map(|elapsed| elapsed <= Duration::from_secs(60))
+        .unwrap_or(false);
+    let is_small_file = file_size < 50 * 1024 * 1024;
+    let is_recently_modified = (is_recently_modified && is_small_file) || is_recently_created;
 
     let start_offset = if is_recently_modified {
         0
