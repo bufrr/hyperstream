@@ -134,29 +134,27 @@ impl crate::parsers::Parser for BlocksParser {
                             self.proposer_cache.insert(height, block.proposer.clone());
                         }
 
-                        // Convert to ReplicaBlockData and process through merger
+                        // Convert to ReplicaBlockData and emit without hash (merging deferred)
                         if let Some(replica_data) = self.abci_block_to_replica_data(block, height) {
-                            // Process block - looks up hash from cache, validates, and returns merged block
-                            // Returns None if Redis data exists but validation fails
-                            if let Some(merged) =
-                                self.merger.process_file_block_blocking(replica_data)
-                            {
-                                match merged.to_data_record() {
-                                    Ok(data_record) => {
-                                        // Update latest block height gauge metric
-                                        LATEST_BLOCK_HEIGHT.set(height as i64);
-                                        records.push(data_record);
-                                    }
-                                    Err(err) => {
-                                        warn!(
-                                            error = %err,
-                                            height,
-                                            "failed to convert merged block to data record"
-                                        );
-                                    }
+                            let merged = crate::parsers::block_merger::MergedBlock::from_replica_data(
+                                replica_data,
+                                None,
+                            );
+
+                            match merged.to_data_record() {
+                                Ok(data_record) => {
+                                    // Update latest block height gauge metric
+                                    LATEST_BLOCK_HEIGHT.set(height as i64);
+                                    records.push(data_record);
+                                }
+                                Err(err) => {
+                                    warn!(
+                                        error = %err,
+                                        height,
+                                        "failed to convert merged block to data record"
+                                    );
                                 }
                             }
-                            // If None, block was dropped due to validation failure (already warned in merger)
                         }
                     }
                 }
