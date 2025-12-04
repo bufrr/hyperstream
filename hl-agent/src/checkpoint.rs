@@ -129,6 +129,22 @@ impl CheckpointDB {
 
         Ok(())
     }
+
+    /// Clear all checkpoints from the database.
+    /// Used when skip_historical=true to ensure fresh starts from end of files.
+    pub async fn clear_all(&self) -> Result<()> {
+        let db_path = self.path.clone();
+        task::spawn_blocking(move || {
+            let conn = open_connection(&db_path)?;
+            conn.execute("DELETE FROM checkpoints", [])
+                .context("failed to clear checkpoints")?;
+            Ok::<_, anyhow::Error>(())
+        })
+        .await
+        .context("checkpoint clear_all join error")??;
+
+        Ok(())
+    }
 }
 
 fn normalize_path(path: &Path) -> String {

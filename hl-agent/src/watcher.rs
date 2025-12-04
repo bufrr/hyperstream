@@ -91,6 +91,8 @@ pub async fn watch_directories(
 
                 if first_scan && skip_historical {
                     initial_skip_historical_scan(&watch_paths, &mut ctx);
+                } else if skip_historical {
+                    ongoing_skip_historical_scan(&watch_paths, &mut ctx);
                 } else {
                     for watch_path in &watch_paths {
                         scan_directory_recursive(watch_path, &mut ctx);
@@ -174,10 +176,83 @@ fn initial_skip_historical_scan(
             .or_else(|| fallback_latest.clone())
         {
             info!(path = %path.display(), "skip_historical: starting with latest file");
-            log_file_detection(&path, "scan_created");
-            let event = FileEvent::Created(path.clone());
+            log_file_detection(&path, "scan_modified");
+            // Emit Modified (not Created) so runner knows this is an existing file
+            // and should start from end rather than creating checkpoint at offset 0
+            let event = FileEvent::Modified(path.clone());
             record_activity(&event, ctx.file_activity, ctx.last_event_time);
             send_event(ctx.event_tx, event, "scan");
+        }
+    }
+}
+
+fn ongoing_skip_historical_scan(
+    watch_paths: &[PathBuf],
+    ctx: &mut ScanContext,
+) {
+    for watch_path in watch_paths {
+        trace!(path = %watch_path.display(), "ongoing scan (skip_historical)");
+
+        for entry in WalkDir::new(watch_path).into_iter().filter_map(|e| e.ok()) {
+            let path = entry.path();
+
+            if entry.file_type().is_dir() {
+                ctx.scan_stats.dirs_scanned += 1;
+                if ctx.seen_dirs.insert(path.to_path_buf()) {
+                    ctx.scan_stats.directories_discovered += 1;
+                    info!(path = %path.display(), "discovered new directory during ongoing scan");
+                }
+                continue;
+            }
+
+            if entry.file_type().is_file() {
+                ctx.scan_stats.files_found += 1;
+
+                let metadata = match entry.metadata() {
+                    Ok(metadata) => metadata,
+                    Err(err) => {
+                        debug!(path = %path.display(), error = %err, "failed to read metadata");
+                        continue;
+                    }
+                };
+
+                let modified_time = metadata.modified().ok();
+                let path_buf = path.to_path_buf();
+                let mut event = None;
+
+                if ctx.seen_files.insert(path_buf.clone()) {
+                    if let Some(mod_time) = modified_time {
+                        ctx.file_mod_times.insert(path_buf.clone(), mod_time);
+                    }
+                    log_file_detection(path, "ongoing_scan_new_file");
+                    event = Some(FileEvent::Created(path_buf));
+                } else if let (Some(mod_time), Some(previous)) =
+                    (modified_time, ctx.file_mod_times.get(&path_buf))
+                {
+                    if mod_time > *previous {
+                        ctx.file_mod_times.insert(path_buf.clone(), mod_time);
+                        let now = Instant::now();
+                        let should_emit = ctx.last_event_time
+                            .get(&path_buf)
+                            .map(|last| now.duration_since(*last) > MODIFIED_EVENT_THROTTLE)
+                            .unwrap_or(true);
+
+                        if should_emit {
+                            log_file_detection(path, "ongoing_scan_modified");
+                            event = Some(FileEvent::Modified(path_buf));
+                        } else {
+                            trace!(path = %path.display(), "throttling modified event");
+                        }
+                    }
+                } else if let Some(mod_time) = modified_time {
+                    ctx.file_mod_times.entry(path_buf.clone()).or_insert(mod_time);
+                }
+
+                if let Some(event) = event {
+                    record_activity(&event, ctx.file_activity, ctx.last_event_time);
+                    send_event(ctx.event_tx, event, "ongoing_scan");
+                }
+            }
         }
     }
 }

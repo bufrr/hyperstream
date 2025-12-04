@@ -1,5 +1,5 @@
 use crate::metrics::LATEST_BLOCK_HEIGHT;
-use crate::parsers::block_merger::ReplicaBlockData;
+use crate::parsers::block_merger::{BlockMerger, ReplicaBlockData};
 use crate::parsers::utils::extract_starting_block;
 use crate::parsers::{
     drain_complete_lines, line_preview, parse_iso8601_to_millis, trim_line_bytes,
@@ -44,6 +44,8 @@ pub struct BlocksParser {
     starting_block: Option<u64>,
     /// Current line count within the file (0-indexed, first line = block at starting_block)
     line_count: u64,
+    /// BlockMerger for fetching hashes from Redis or Explorer API
+    merger: Arc<BlockMerger>,
 }
 
 impl Default for BlocksParser {
@@ -53,6 +55,7 @@ impl Default for BlocksParser {
             proposer_cache: proposer_cache(),
             starting_block: None,
             line_count: 0,
+            merger: BlockMerger::global(),
         }
     }
 }
@@ -131,28 +134,28 @@ impl crate::parsers::Parser for BlocksParser {
                             self.proposer_cache.insert(height, block.proposer.clone());
                         }
 
-                        // Convert to ReplicaBlockData and emit without hash (merging deferred)
+                        // Convert to ReplicaBlockData and merge with hash from Redis/Explorer
                         if let Some(replica_data) = self.abci_block_to_replica_data(block, height) {
-                            let merged =
-                                crate::parsers::block_merger::MergedBlock::from_replica_data(
-                                    replica_data,
-                                    None,
-                                );
+                            // Process through BlockMerger to get hash from Redis or Explorer API
+                            let merged_opt = self.merger.process_file_block_blocking(replica_data);
 
-                            match merged.to_data_record() {
-                                Ok(data_record) => {
-                                    // Update latest block height gauge metric
-                                    LATEST_BLOCK_HEIGHT.set(height as i64);
-                                    records.push(data_record);
-                                }
-                                Err(err) => {
-                                    warn!(
-                                        error = %err,
-                                        height,
-                                        "failed to convert merged block to data record"
-                                    );
+                            if let Some(merged) = merged_opt {
+                                match merged.to_data_record() {
+                                    Ok(data_record) => {
+                                        // Update latest block height gauge metric
+                                        LATEST_BLOCK_HEIGHT.set(height as i64);
+                                        records.push(data_record);
+                                    }
+                                    Err(err) => {
+                                        warn!(
+                                            error = %err,
+                                            height,
+                                            "failed to convert merged block to data record"
+                                        );
+                                    }
                                 }
                             }
+                            // If merged_opt is None, validation failed - block is dropped
                         }
                     }
                 }

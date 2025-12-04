@@ -19,13 +19,11 @@ pub use buffered::{BufferedLineParser, LineParser};
 pub(crate) use utils::*;
 pub use utils::{current_timestamp, LINE_PREVIEW_LIMIT};
 
-pub use blocks::BlocksParser;
 pub use fills::new_fills_parser;
 pub use misc_events::new_misc_events_parser;
 pub use orders::OrdersParser;
 pub use replica_cmds::ReplicaCmdsParser;
 pub use trades::TradesParser;
-pub use transactions::TransactionsParser;
 
 /// State machine that converts file fragments produced by the tailer into `DataRecord`s.
 ///

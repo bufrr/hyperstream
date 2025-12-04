@@ -15,8 +15,6 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
-use tokio::fs::File;
-use tokio::io::AsyncReadExt;
 use tokio::sync::{mpsc, mpsc::error::TrySendError, Mutex, Semaphore};
 use tokio::task::JoinHandle;
 use tokio::time::sleep;
@@ -66,9 +64,16 @@ impl FileRunner {
             bulk_load_warn_bytes: config.performance.bulk_load_warn_bytes,
             bulk_load_abort_bytes: config.performance.bulk_load_abort_bytes,
             cancel_token: cancel_token.clone(),
+            skip_checkpoints: config.skip_historical(),
         };
 
         let (event_tx, event_rx) = mpsc::channel(WATCHER_CHANNEL_CAPACITY);
+
+        // Clear all checkpoints when skip_historical is enabled to ensure fresh starts
+        if config.skip_historical() {
+            info!("skip_historical enabled - clearing all checkpoints for fresh start");
+            checkpoint_db.clear_all().await?;
+        }
 
         Ok(Self {
             config: config.clone(),
@@ -371,11 +376,25 @@ async fn maybe_skip_historical_for_path(
     path: &PathBuf,
     checkpoint_db: &Arc<CheckpointDB>,
     skip_historical: bool,
-    tail_bytes: u64,
+    _tail_bytes: u64,
     is_new_file: bool,
 ) -> Result<()> {
-    // If this is a newly created file detected by watcher, ALWAYS start from 0
-    // This must be checked FIRST, before checkpoint existence check
+    // When skip_historical=true, DON'T create any checkpoints during file discovery.
+    // The tailer will handle starting from the current end of file naturally.
+    // This applies to BOTH existing files AND newly created files.
+    // Checkpoints will be created as tailers process data.
+    if skip_historical {
+        info!(
+            path = %path.display(),
+            is_new_file,
+            "skip_historical enabled - letting tailer start from current end of file"
+        );
+        return Ok(());
+    }
+
+    // skip_historical=false: Process all data from the beginning
+
+    // If this is a newly created file detected by watcher, start from 0
     if is_new_file {
         let metadata = tokio::fs::metadata(path).await?;
         let last_modified = metadata.modified().unwrap_or(UNIX_EPOCH);
@@ -396,100 +415,13 @@ async fn maybe_skip_historical_for_path(
         return Ok(());
     }
 
-    // When skip_historical=false, respect existing checkpoints (resume where we left off)
-    if !skip_historical {
-        // Check if checkpoint already exists
-        let existing_checkpoint = checkpoint_db.get(path).await?;
-        if existing_checkpoint.is_some() {
-            // Checkpoint exists and we're not skipping history - respect it
-            return Ok(());
-        }
-        // No checkpoint exists and skip_historical=false - start from beginning (offset 0)
+    // Respect existing checkpoints (resume where we left off)
+    let existing_checkpoint = checkpoint_db.get(path).await?;
+    if existing_checkpoint.is_some() {
+        // Checkpoint exists and we're not skipping history - respect it
         return Ok(());
     }
-
-    // When skip_historical=true, only skip to end/tail if we have not established a checkpoint yet.
-    // If a checkpoint already exists, leave it untouched so active tailers can continue.
-    if checkpoint_db.get(path).await?.is_some() {
-        return Ok(());
-    }
-
-    let metadata = tokio::fs::metadata(path).await?;
-    let last_modified = metadata.modified().unwrap_or(UNIX_EPOCH);
-    let last_modified_ts = last_modified
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_else(|_| Duration::from_secs(0))
-        .as_secs() as i64;
-    let file_size = metadata.len();
-
-    let now = SystemTime::now();
-    let is_recently_modified = now
-        .duration_since(last_modified)
-        .map(|elapsed| elapsed <= Duration::from_secs(60))
-        .unwrap_or(false);
-    let is_recently_created = metadata
-        .created()
-        .ok()
-        .and_then(|created| now.duration_since(created).ok())
-        .map(|elapsed| elapsed <= Duration::from_secs(60))
-        .unwrap_or(false);
-    let is_small_file = file_size < 50 * 1024 * 1024;
-    let is_recently_modified = (is_recently_modified && is_small_file) || is_recently_created;
-
-    let start_offset = if is_recently_modified {
-        0
-    } else if tail_bytes == 0 {
-        file_size
-    } else {
-        file_size.saturating_sub(tail_bytes)
-    };
-
-    let line_count = if start_offset == 0 || !is_replica_cmds_path(path) {
-        0
-    } else {
-        let file = File::open(path).await?;
-        let mut reader = file.take(start_offset);
-        let mut buf = vec![0u8; 8192];
-        let mut newline_count: u64 = 0;
-
-        loop {
-            let bytes_read = reader.read(&mut buf).await?;
-            if bytes_read == 0 {
-                break;
-            }
-            newline_count += buf[..bytes_read].iter().filter(|&&b| b == b'\n').count() as u64;
-        }
-
-        newline_count
-    };
-
-    checkpoint_db
-        .set_offset(path, start_offset, file_size, last_modified_ts, line_count)
-        .await?;
-
-    if is_recently_modified {
-        info!(
-            path = %path.display(),
-            "New actively-written file detected - starting from beginning"
-        );
-    } else if tail_bytes == 0 {
-        info!(
-            path = %path.display(),
-            offset = start_offset,
-            "skip_historical enabled - skipping to end of file"
-        );
-    } else {
-        let bytes_to_read = file_size.saturating_sub(start_offset);
-        info!(
-            path = %path.display(),
-            offset = start_offset,
-            file_size,
-            bytes_to_read,
-            "skip_historical enabled - reading last {} bytes",
-            bytes_to_read
-        );
-    }
-
+    // No checkpoint exists and skip_historical=false - start from beginning (offset 0)
     Ok(())
 }
 
@@ -736,12 +668,6 @@ async fn activity_monitor(
             }
         }
     }
-}
-
-fn is_replica_cmds_path(path: &Path) -> bool {
-    path.iter()
-        .filter_map(|c| c.to_str())
-        .any(|component| component == "replica_cmds")
 }
 
 fn file_priority(path: &Path) -> u8 {

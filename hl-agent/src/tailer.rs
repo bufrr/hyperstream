@@ -18,6 +18,36 @@ const DEFAULT_POLL_INTERVAL_MS: u64 = 100;
 const MAX_READ_CHUNK_BYTES: usize = 8 * 1024 * 1024; // 8 MiB per iteration
 const FILE_SIZE_STABLE_POLLS: u32 = 2; // Number of polls with unchanged size to consider file stable
 
+/// Count newlines from start of file up to the given offset.
+/// Used to initialize line_count when starting from middle/end of file without checkpoint.
+async fn count_newlines_up_to_offset(file_path: &Path, offset: u64) -> Result<u64> {
+    if offset == 0 {
+        return Ok(0);
+    }
+
+    let mut file = fs::File::open(file_path).await
+        .context("failed to open file for newline counting")?;
+
+    let mut newline_count = 0u64;
+    let mut read_offset = 0u64;
+    let mut buffer = vec![0u8; MAX_READ_CHUNK_BYTES];
+
+    while read_offset < offset {
+        let bytes_to_read = std::cmp::min(MAX_READ_CHUNK_BYTES as u64, offset - read_offset) as usize;
+        let bytes_read = file.read(&mut buffer[..bytes_to_read]).await?;
+
+        if bytes_read == 0 {
+            break; // EOF
+        }
+
+        // Count newlines in this chunk
+        newline_count += buffer[..bytes_read].iter().filter(|&&b| b == b'\n').count() as u64;
+        read_offset += bytes_read as u64;
+    }
+
+    Ok(newline_count)
+}
+
 #[derive(Clone)]
 pub struct TailerConfig {
     pub checkpoint_db: Arc<CheckpointDB>,
@@ -27,6 +57,8 @@ pub struct TailerConfig {
     pub bulk_load_warn_bytes: u64,
     pub bulk_load_abort_bytes: u64,
     pub cancel_token: CancellationToken,
+    /// When true, skip writing checkpoints (used with skip_historical mode)
+    pub skip_checkpoints: bool,
 }
 
 async fn sleep_or_cancel(duration: Duration, cancel_token: &CancellationToken) -> bool {
@@ -302,6 +334,7 @@ pub async fn tail_file(
         bulk_load_warn_bytes,
         bulk_load_abort_bytes,
         cancel_token,
+        skip_checkpoints,
     } = config;
 
     let mut active_parsers = active_parsers;
@@ -309,8 +342,35 @@ pub async fn tail_file(
     if let Some(rec) = &checkpoint {
         debug!(path = %rec.file_path.display(), file_size = rec.file_size, last_modified_ts = rec.last_modified_ts, updated_at = rec.updated_at, "resuming from checkpoint");
     }
-    let read_offset = checkpoint.as_ref().map(|rec| rec.byte_offset).unwrap_or(0);
-    let initial_line_count = checkpoint.as_ref().map(|rec| rec.line_count).unwrap_or(0);
+
+    // If no checkpoint exists and skip_historical is enabled, start from end of file
+    let read_offset = if let Some(rec) = checkpoint.as_ref() {
+        rec.byte_offset
+    } else {
+        // No checkpoint - check if we should start from end of file
+        match tokio::fs::metadata(&file_path).await {
+            Ok(metadata) => {
+                let file_size = metadata.len();
+                info!(
+                    path = %file_path.display(),
+                    file_size = file_size,
+                    "no checkpoint found - starting from end of file (skip_historical mode)"
+                );
+                file_size
+            }
+            Err(_) => {
+                // File doesn't exist yet or can't read metadata, start from 0
+                0
+            }
+        }
+    };
+
+    // Calculate initial line count: use checkpoint if available, otherwise count lines up to read_offset
+    let initial_line_count = match checkpoint.as_ref() {
+        Some(rec) => rec.line_count,
+        None => count_newlines_up_to_offset(&file_path, read_offset).await.unwrap_or(0),
+    };
+
     for parser in active_parsers.iter_mut() {
         parser.set_initial_line_count(initial_line_count);
     }
@@ -337,6 +397,7 @@ pub async fn tail_file(
                 bulk_load_warn_bytes,
                 bulk_load_abort_bytes,
                 cancel_token: cancel_token.clone(),
+                skip_checkpoints,
             },
             sleep_interval,
             shutdown_rx,
@@ -355,6 +416,7 @@ pub async fn tail_file(
         batch_size,
         cancel_token,
         shutdown_rx,
+        skip_checkpoints,
     )
     .await
 }
@@ -366,6 +428,7 @@ async fn run_tail_loop(
     batch_size: usize,
     cancel_token: CancellationToken,
     mut shutdown_rx: Option<mpsc::Receiver<()>>,
+    skip_checkpoints: bool,
 ) -> Result<()> {
     loop {
         let loop_start = std::time::Instant::now();
@@ -439,7 +502,7 @@ async fn run_tail_loop(
                         loop_start,
                     )
                     .await?;
-                    update_checkpoint(&state.file_path, &chunk, &checkpoint_db).await?;
+                    update_checkpoint(&state.file_path, &chunk, &checkpoint_db, skip_checkpoints).await?;
 
                     if !had_records
                         && sleep_or_shutdown(state.sleep_interval, &cancel_token, &mut shutdown_rx)
@@ -526,7 +589,14 @@ async fn update_checkpoint(
     file_path: &Path,
     chunk: &ParsedChunk,
     checkpoint_db: &CheckpointDB,
+    skip_checkpoints: bool,
 ) -> Result<()> {
+    // When skip_checkpoints is true (skip_historical mode), don't write checkpoints
+    // This ensures we always start from end of file on restart
+    if skip_checkpoints {
+        return Ok(());
+    }
+
     let checkpoint_start = std::time::Instant::now();
     checkpoint_db
         .set_offset(
@@ -682,6 +752,7 @@ async fn tail_blocks_file_bulk(
         bulk_load_warn_bytes,
         bulk_load_abort_bytes,
         cancel_token,
+        skip_checkpoints: _,
     } = config;
 
     let mut active_parsers = active_parsers;

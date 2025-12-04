@@ -247,7 +247,7 @@ impl BlockMerger {
     }
 
     /// Process a block from the file parser asynchronously, fetching the hash if available.
-    /// Returns None if Redis data exists but validation fails (block_time or proposer mismatch).
+    /// Always returns Some(MergedBlock), emitting without hash if validation fails.
     pub async fn process_file_block(&self, data: ReplicaBlockData) -> Option<MergedBlock> {
         self.stats.blocks_processed.fetch_add(1, Ordering::Relaxed);
 
@@ -269,7 +269,7 @@ impl BlockMerger {
     }
 
     /// Blocking helper for synchronous callers (e.g., parsers running inside Tokio tasks).
-    /// Returns None if Redis data exists but validation fails.
+    /// Always returns Some(MergedBlock), emitting without hash if validation fails.
     pub fn process_file_block_blocking(&self, data: ReplicaBlockData) -> Option<MergedBlock> {
         if let Ok(handle) = Handle::try_current() {
             task::block_in_place(|| handle.block_on(self.process_file_block(data)))
@@ -311,30 +311,36 @@ impl BlockMerger {
         redis_data: RedisBlockData,
         total_start: Instant,
     ) -> Option<MergedBlock> {
+        // Redis had data - always count as cache hit
+        Self::inc_redis_cache("hit");
+        self.stats.hash_hits.fetch_add(1, Ordering::Relaxed);
+
+        // Validate Redis data matches file data
         if let Some(reason) =
             Self::validation_reason(&data, redis_data.block_time, &redis_data.proposer)
         {
-            self.stats.hash_misses.fetch_add(1, Ordering::Relaxed);
-            self.stats
-                .validation_failures
-                .fetch_add(1, Ordering::Relaxed);
-            Self::inc_validation_failure(reason);
-            Self::inc_redis_cache("miss");
-            Self::observe_duration("total.dropped", total_start.elapsed());
-
             warn!(
                 height = data.height,
                 expected_block_time = data.block_time,
                 actual_block_time = redis_data.block_time,
                 expected_proposer = %data.proposer,
                 actual_proposer = %redis_data.proposer,
-                "Redis block data validation failed; dropping block"
+                "Redis cache data validation failed; emitting without hash"
             );
-            return None;
+
+            Self::inc_validation_failure(reason);
+            self.stats.validation_failures.fetch_add(1, Ordering::Relaxed);
+
+            crate::metrics::BLOCKS_WITHOUT_HASH_TOTAL
+                .with_label_values(&["redis_validation_failed"])
+                .inc();
+            Self::observe_duration("total.emitted", total_start.elapsed());
+
+            // Emit block without hash when validation fails
+            return Some(MergedBlock::from_replica_data(data, None));
         }
 
-        self.stats.hash_hits.fetch_add(1, Ordering::Relaxed);
-        Self::inc_redis_cache("hit");
+        // Validation passed - use Redis hash
         Self::observe_duration("total.emitted", total_start.elapsed());
         Some(MergedBlock::from_replica_data(data, Some(redis_data.hash)))
     }
@@ -438,10 +444,11 @@ mod tests {
 
         store.cache_insert_for_test(400, redis_data(1_800_000_000_000, "proposer", "0xfeedface"));
 
-        assert!(
-            merger.process_file_block(sample_block(400)).await.is_none(),
-            "block should be dropped on validation failure"
-        );
+        let validation_fail = merger
+            .process_file_block(sample_block(400))
+            .await
+            .expect("block should be emitted without hash on validation failure");
+        assert_eq!(validation_fail.hash, "", "hash should be empty on validation failure");
         assert_eq!(merger.stats.validation_failures.load(Ordering::Relaxed), 1);
     }
 
