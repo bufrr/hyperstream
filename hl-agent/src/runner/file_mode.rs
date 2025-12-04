@@ -119,6 +119,11 @@ impl FileRunner {
     }
 
     async fn seed_existing_files(&mut self) -> Result<()> {
+        if self.skip_historical {
+            info!("skip_historical enabled; deferring file discovery to watcher");
+            return Ok(());
+        }
+
         let mut existing_files = discover_existing_files(&self.watch_paths)?;
         let checkpoint_db = self.checkpoint_db.clone();
 
@@ -176,6 +181,18 @@ impl FileRunner {
     }
 
     async fn handle_file_event(&mut self, event: FileEvent) {
+        let event_type = match &event {
+            FileEvent::Created(_) => "Created",
+            FileEvent::Modified(_) => "Modified",
+            FileEvent::Closed(_) => "Closed",
+        };
+        let path_display = match &event {
+            FileEvent::Created(p) | FileEvent::Modified(p) | FileEvent::Closed(p) => {
+                p.display().to_string()
+            }
+        };
+        debug!(event_type, path = %path_display, "received file event from watcher");
+
         if let FileEvent::Closed(path) = event {
             shutdown_tailer_for_path(&self.active_tailers, &self.file_activity, &path).await;
             return;
@@ -391,8 +408,11 @@ async fn maybe_skip_historical_for_path(
         return Ok(());
     }
 
-    // When skip_historical=true, ALWAYS skip to end/tail, ignoring any existing checkpoint
-    // This ensures we only process new data going forward, even after restarts
+    // When skip_historical=true, only skip to end/tail if we have not established a checkpoint yet.
+    // If a checkpoint already exists, leave it untouched so active tailers can continue.
+    if checkpoint_db.get(path).await?.is_some() {
+        return Ok(());
+    }
 
     let metadata = tokio::fs::metadata(path).await?;
     let last_modified = metadata.modified().unwrap_or(UNIX_EPOCH);

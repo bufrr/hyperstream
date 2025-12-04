@@ -17,9 +17,10 @@ pub enum FileEvent {
 }
 
 pub const FILE_RECENCY_WINDOW: Duration = Duration::from_secs(60 * 60);
-pub const WATCHER_CHANNEL_CAPACITY: usize = 1000;
+pub const WATCHER_CHANNEL_CAPACITY: usize = 10000;
 const IDLE_TIMEOUT: Duration = Duration::from_secs(5 * 60);
 const IDLE_CHECK_INTERVAL: Duration = Duration::from_secs(30);
+const MODIFIED_EVENT_THROTTLE: Duration = Duration::from_secs(5);
 
 #[derive(Default)]
 struct ScanStats {
@@ -42,6 +43,7 @@ pub async fn watch_directories(
         seen_dirs.insert(watch_path.clone());
     }
     let mut file_activity: HashMap<PathBuf, Instant> = HashMap::new();
+    let mut last_event_time: HashMap<PathBuf, Instant> = HashMap::new();
     let mut file_mod_times: HashMap<PathBuf, SystemTime> = HashMap::new();
     let mut scan_interval = interval(poll_interval);
     let mut idle_check_interval = interval(IDLE_CHECK_INTERVAL);
@@ -65,6 +67,7 @@ pub async fn watch_directories(
                 seen_files.retain(|path| path.exists());
                 seen_dirs.retain(|path| path.exists());
                 file_mod_times.retain(|path, _| path.exists());
+                last_event_time.retain(|path, _| path.exists());
                 let mut scan_stats = ScanStats::default();
                 if first_scan && skip_historical {
                     initial_skip_historical_scan(
@@ -74,6 +77,7 @@ pub async fn watch_directories(
                         &mut seen_dirs,
                         &mut file_mod_times,
                         &mut file_activity,
+                        &mut last_event_time,
                         &mut scan_stats,
                     );
                 } else {
@@ -85,6 +89,7 @@ pub async fn watch_directories(
                             &mut seen_dirs,
                             &mut file_mod_times,
                             &mut file_activity,
+                            &mut last_event_time,
                             &mut scan_stats,
                         );
                     }
@@ -105,7 +110,7 @@ pub async fn watch_directories(
                 }
             }
             _ = idle_check_interval.tick() => {
-                close_idle_files(&mut file_activity, &event_tx);
+                close_idle_files(&mut file_activity, &mut last_event_time, &event_tx);
             }
         }
     }
@@ -120,6 +125,7 @@ fn initial_skip_historical_scan(
     seen_dirs: &mut HashSet<PathBuf>,
     file_mod_times: &mut HashMap<PathBuf, SystemTime>,
     file_activity: &mut HashMap<PathBuf, Instant>,
+    last_event_time: &mut HashMap<PathBuf, Instant>,
     scan_stats: &mut ScanStats,
 ) {
     for watch_path in watch_paths {
@@ -174,7 +180,7 @@ fn initial_skip_historical_scan(
             info!(path = %path.display(), "skip_historical: starting with latest file");
             log_file_detection(&path, "scan_created");
             let event = FileEvent::Created(path.clone());
-            record_activity(&event, file_activity);
+            record_activity(&event, file_activity, last_event_time);
             send_event(event_tx, event, "scan");
         }
     }
@@ -187,6 +193,7 @@ fn scan_directory_recursive(
     seen_dirs: &mut HashSet<PathBuf>,
     file_mod_times: &mut HashMap<PathBuf, SystemTime>,
     file_activity: &mut HashMap<PathBuf, Instant>,
+    last_event_time: &mut HashMap<PathBuf, Instant>,
     scan_stats: &mut ScanStats,
 ) {
     trace!(path = %dir.display(), "scanning directory");
@@ -241,34 +248,52 @@ fn scan_directory_recursive(
             {
                 if mod_time > *previous {
                     file_mod_times.insert(path_buf.clone(), mod_time);
-                    log_file_detection(path, "scan_modified");
-                    event = Some(FileEvent::Modified(path_buf));
+                    let now = Instant::now();
+                    let should_emit_modified = last_event_time
+                        .get(&path_buf)
+                        .map(|last| now.duration_since(*last) > MODIFIED_EVENT_THROTTLE)
+                        .unwrap_or(true);
+
+                    if should_emit_modified {
+                        log_file_detection(path, "scan_modified");
+                        event = Some(FileEvent::Modified(path_buf));
+                    } else {
+                        trace!(path = %path.display(), "throttling modified event");
+                    }
                 }
             } else if let Some(mod_time) = modified_time {
                 file_mod_times.entry(path_buf.clone()).or_insert(mod_time);
             }
 
             if let Some(event) = event {
-                record_activity(&event, file_activity);
+                record_activity(&event, file_activity, last_event_time);
                 send_event(event_tx, event, "scan");
             }
         }
     }
 }
 
-fn record_activity(event: &FileEvent, file_activity: &mut HashMap<PathBuf, Instant>) {
+fn record_activity(
+    event: &FileEvent,
+    file_activity: &mut HashMap<PathBuf, Instant>,
+    last_event_time: &mut HashMap<PathBuf, Instant>,
+) {
     match event {
         FileEvent::Created(path) | FileEvent::Modified(path) => {
-            file_activity.insert(path.clone(), Instant::now());
+            let now = Instant::now();
+            file_activity.insert(path.clone(), now);
+            last_event_time.insert(path.clone(), now);
         }
         FileEvent::Closed(path) => {
             file_activity.remove(path);
+            last_event_time.remove(path);
         }
     }
 }
 
 fn close_idle_files(
     file_activity: &mut HashMap<PathBuf, Instant>,
+    last_event_time: &mut HashMap<PathBuf, Instant>,
     event_tx: &mpsc::Sender<FileEvent>,
 ) {
     let now = Instant::now();
@@ -282,17 +307,30 @@ fn close_idle_files(
 
     for path in stale_paths {
         file_activity.remove(&path);
+        last_event_time.remove(&path);
         debug!(path = %path.display(), "closing idle file after inactivity");
         send_event(event_tx, FileEvent::Closed(path), "idle_close");
     }
 }
 
 fn send_event(event_tx: &mpsc::Sender<FileEvent>, event: FileEvent, kind: &str) {
+    let event_path = match &event {
+        FileEvent::Created(p) | FileEvent::Modified(p) | FileEvent::Closed(p) => {
+            p.display().to_string()
+        }
+    };
+
     if let Err(err) = event_tx.try_send(event) {
         match err {
-            TrySendError::Full(_) => warn!(kind, "watcher channel full; dropping file event"),
-            TrySendError::Closed(_) => warn!(kind, "watcher channel closed; dropping file event"),
+            TrySendError::Full(_) => {
+                warn!(kind, path = %event_path, "watcher channel full; dropping file event");
+            }
+            TrySendError::Closed(_) => {
+                warn!(kind, path = %event_path, "watcher channel closed; dropping file event");
+            }
         }
+    } else {
+        trace!(kind, path = %event_path, "file event sent successfully");
     }
 }
 

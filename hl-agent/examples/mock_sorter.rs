@@ -13,7 +13,7 @@ use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use prost::Message;
 use serde::Serialize;
@@ -40,7 +40,7 @@ struct Config {
 impl Config {
     fn from_args() -> Result<Self, Box<dyn std::error::Error>> {
         let mut listen = "0.0.0.0:50051".to_string();
-        let mut stats_interval_ms: u64 = 5_000;
+        let mut stats_interval_ms: u64 = 3_000;
         let mut delay_ms: u64 = 0;
         let mut output_dir: Option<PathBuf> = None;
 
@@ -95,7 +95,7 @@ impl Config {
     }
 
     fn usage() -> &'static str {
-        "mock_sorter options:\n  --listen-addr <addr>         Socket address to bind (default 0.0.0.0:50051)\n  --stats-interval-ms <ms>     Interval for stats logs (default 5000)\n  --output-dir <path>          Write each batch to JSON inside <path>\n  --delay-ms <ms>              Simulate per-batch processing delay (default 0)\n  --help                       Show this message"
+        "mock_sorter options:\n  --listen-addr <addr>         Socket address to bind (default 0.0.0.0:50051)\n  --stats-interval-ms <ms>     Interval for stats logs (default 3000)\n  --output-dir <path>          Write each batch to JSON inside <path>\n  --delay-ms <ms>              Simulate per-batch processing delay (default 0)\n  --help                       Show this message"
     }
 }
 
@@ -117,11 +117,14 @@ impl SorterService for MockSorter {
             warn!(error = %status, "client stream error");
             status
         })? {
+            let start = Instant::now();
+
             if !self.processing_delay.is_zero() {
                 tokio::time::sleep(self.processing_delay).await;
             }
 
-            let report = self.stats.ingest_batch(&batch);
+            let latency_us = start.elapsed().as_micros() as u64;
+            let report = self.stats.ingest_batch(&batch, latency_us);
             if report.invalid_records > 0 {
                 warn!(
                     invalid = report.invalid_records,
@@ -153,6 +156,9 @@ struct StatsTracker {
     records_by_topic: Mutex<HashMap<String, u64>>,
     unique_tx_hashes: Mutex<HashSet<String>>,
     unique_block_heights: Mutex<HashSet<u64>>,
+    batch_latencies_us: Mutex<Vec<u64>>,
+    records_per_batch: Mutex<Vec<u64>>,
+    bytes_per_batch: Mutex<Vec<u64>>,
 }
 
 impl StatsTracker {
@@ -165,15 +171,32 @@ impl StatsTracker {
             records_by_topic: Mutex::new(HashMap::new()),
             unique_tx_hashes: Mutex::new(HashSet::new()),
             unique_block_heights: Mutex::new(HashSet::new()),
+            batch_latencies_us: Mutex::new(Vec::new()),
+            records_per_batch: Mutex::new(Vec::new()),
+            bytes_per_batch: Mutex::new(Vec::new()),
         }
     }
 
-    fn ingest_batch(&self, batch: &DataBatch) -> BatchIngestReport {
+    fn ingest_batch(&self, batch: &DataBatch, latency_us: u64) -> BatchIngestReport {
         self.total_batches.fetch_add(1, Ordering::Relaxed);
-        self.total_records
-            .fetch_add(batch.records.len() as u64, Ordering::Relaxed);
-        self.total_bytes
-            .fetch_add(batch.encoded_len() as u64, Ordering::Relaxed);
+        let record_count = batch.records.len() as u64;
+        let byte_count = batch.encoded_len() as u64;
+
+        self.total_records.fetch_add(record_count, Ordering::Relaxed);
+        self.total_bytes.fetch_add(byte_count, Ordering::Relaxed);
+
+        {
+            let mut latencies = self.batch_latencies_us.lock().unwrap();
+            latencies.push(latency_us);
+        }
+        {
+            let mut records = self.records_per_batch.lock().unwrap();
+            records.push(record_count);
+        }
+        {
+            let mut bytes = self.bytes_per_batch.lock().unwrap();
+            bytes.push(byte_count);
+        }
 
         let mut invalid_records = 0_u64;
         let mut invalid_reasons = Vec::new();
@@ -232,6 +255,27 @@ impl StatsTracker {
     }
 
     fn snapshot(&self) -> StatsSnapshot {
+        let latency_p50 = {
+            let mut latencies = self.batch_latencies_us.lock().unwrap();
+            let p50 = calculate_p50(&mut latencies);
+            latencies.clear();
+            p50
+        };
+
+        let records_p50 = {
+            let mut records = self.records_per_batch.lock().unwrap();
+            let p50 = calculate_p50(&mut records);
+            records.clear();
+            p50
+        };
+
+        let bytes_p50 = {
+            let mut bytes = self.bytes_per_batch.lock().unwrap();
+            let p50 = calculate_p50(&mut bytes);
+            bytes.clear();
+            p50
+        };
+
         StatsSnapshot {
             total_batches: self.total_batches.load(Ordering::Relaxed),
             total_records: self.total_records.load(Ordering::Relaxed),
@@ -240,6 +284,9 @@ impl StatsTracker {
             topic_counts: self.records_by_topic.lock().unwrap().clone(),
             unique_tx: self.unique_tx_hashes.lock().unwrap().len() as u64,
             unique_block_heights: self.unique_block_heights.lock().unwrap().len() as u64,
+            latency_p50_us: latency_p50,
+            records_per_batch_p50: records_p50,
+            bytes_per_batch_p50: bytes_p50,
         }
     }
 }
@@ -253,6 +300,9 @@ struct StatsSnapshot {
     topic_counts: HashMap<String, u64>,
     unique_tx: u64,
     unique_block_heights: u64,
+    latency_p50_us: u64,
+    records_per_batch_p50: u64,
+    bytes_per_batch_p50: u64,
 }
 
 struct RecordWriter {
@@ -368,6 +418,15 @@ fn to_hex(bytes: &[u8]) -> String {
     out
 }
 
+fn calculate_p50(values: &mut [u64]) -> u64 {
+    if values.is_empty() {
+        return 0;
+    }
+    values.sort_unstable();
+    let mid = values.len() / 2;
+    values[mid]
+}
+
 fn spawn_stats_logger(stats: Arc<StatsTracker>, interval: Duration) {
     tokio::spawn(async move {
         let mut previous = StatsSnapshot::default();
@@ -397,7 +456,6 @@ fn log_stats(previous: &StatsSnapshot, current: &StatsSnapshot, interval: Durati
             .join(", ")
     };
 
-    // Build total counts per topic (all 6 expected topics)
     let expected_topics = [
         "hl.blocks",
         "hl.transactions",
@@ -414,7 +472,6 @@ fn log_stats(previous: &StatsSnapshot, current: &StatsSnapshot, interval: Durati
         })
         .collect();
 
-    // Count how many of the 6 expected topics have data
     let topics_with_data = expected_topics
         .iter()
         .filter(|&&t| current.topic_counts.get(t).copied().unwrap_or(0) > 0)
@@ -431,6 +488,9 @@ fn log_stats(previous: &StatsSnapshot, current: &StatsSnapshot, interval: Durati
         unique_block_heights = current.unique_block_heights,
         invalid_records = current.invalid_records,
         topics_coverage = format!("{}/6", topics_with_data),
+        latency_p50_us = current.latency_p50_us,
+        records_per_batch_p50 = current.records_per_batch_p50,
+        bytes_per_batch_p50 = current.bytes_per_batch_p50,
         topic_totals = %topics_total.join(", "),
         topic_rates = %topics_rate,
         "sorter stats"
