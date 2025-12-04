@@ -470,7 +470,7 @@ async fn run_tail_loop(
 }
 
 async fn dispatch_batches(
-    file_path: &PathBuf,
+    file_path: &Path,
     chunk: &mut ParsedChunk,
     record_sink: &Arc<dyn RecordSink>,
     batch_size: usize,
@@ -523,7 +523,7 @@ async fn dispatch_batches(
 }
 
 async fn update_checkpoint(
-    file_path: &PathBuf,
+    file_path: &Path,
     chunk: &ParsedChunk,
     checkpoint_db: &CheckpointDB,
 ) -> Result<()> {
@@ -545,7 +545,7 @@ async fn update_checkpoint(
 }
 
 async fn checkpoint_parse_failure(
-    file_path: &PathBuf,
+    file_path: &Path,
     read_offset: u64,
     file_size: u64,
     last_modified_ts: i64,

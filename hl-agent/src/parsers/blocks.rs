@@ -1,5 +1,5 @@
 use crate::metrics::LATEST_BLOCK_HEIGHT;
-use crate::parsers::block_merger::{BlockMerger, ReplicaBlockData};
+use crate::parsers::block_merger::ReplicaBlockData;
 use crate::parsers::utils::extract_starting_block;
 use crate::parsers::{
     drain_complete_lines, line_preview, parse_iso8601_to_millis, trim_line_bytes,
@@ -44,8 +44,6 @@ pub struct BlocksParser {
     starting_block: Option<u64>,
     /// Current line count within the file (0-indexed, first line = block at starting_block)
     line_count: u64,
-    /// Reference to the global block merger
-    merger: Arc<BlockMerger>,
 }
 
 impl Default for BlocksParser {
@@ -55,7 +53,6 @@ impl Default for BlocksParser {
             proposer_cache: proposer_cache(),
             starting_block: None,
             line_count: 0,
-            merger: BlockMerger::global(),
         }
     }
 }
@@ -100,7 +97,7 @@ impl crate::parsers::Parser for BlocksParser {
                 incoming_data_size = data.len(),
                 "BlocksParser buffer size limit exceeded"
             );
-            bail!("BlocksParser buffer exceeded {} bytes", MAX_BUFFER_SIZE);
+            bail!("BlocksParser buffer exceeded {MAX_BUFFER_SIZE} bytes");
         }
 
         self.buffer.extend_from_slice(data);

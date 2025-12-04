@@ -149,8 +149,7 @@ impl Parser for TransactionsParser {
                 "TransactionsParser buffer size limit exceeded"
             );
             bail!(
-                "TransactionsParser buffer exceeded {} bytes",
-                MAX_BUFFER_SIZE
+                "TransactionsParser buffer exceeded {MAX_BUFFER_SIZE} bytes"
             );
         }
 

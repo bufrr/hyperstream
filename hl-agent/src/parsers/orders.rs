@@ -195,11 +195,7 @@ fn value_to_string(value: &Value) -> Option<String> {
         Some(num.to_string())
     } else if let Some(num) = value.as_f64() {
         Some(num.to_string())
-    } else if let Some(b) = value.as_bool() {
-        Some(b.to_string())
-    } else {
-        None
-    }
+    } else { value.as_bool().map(|b| b.to_string()) }
 }
 
 #[cfg(test)]

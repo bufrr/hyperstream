@@ -1,5 +1,5 @@
 use crate::metrics::LATEST_BLOCK_HEIGHT;
-use crate::parsers::block_merger::{BlockMerger, ReplicaBlockData};
+use crate::parsers::block_merger::ReplicaBlockData;
 use crate::parsers::blocks::{proposer_cache, SharedProposerCache};
 use crate::parsers::utils::{deserialize_option_string, extract_starting_block};
 use crate::parsers::{
@@ -11,7 +11,6 @@ use anyhow::{bail, Context, Result};
 use serde::{Deserialize, Serialize};
 use sonic_rs::{JsonContainerTrait, JsonValueTrait, Value};
 use std::path::Path;
-use std::sync::Arc;
 use tracing::warn;
 
 /// Maximum buffer size before refusing to accept more data (32 MiB).
@@ -33,8 +32,6 @@ pub struct ReplicaCmdsParser {
     starting_block: Option<u64>,
     /// Current line count within the file (0-indexed, first line = block at starting_block)
     line_count: u64,
-    /// Reference to the global block merger
-    merger: Arc<BlockMerger>,
 }
 
 impl Default for ReplicaCmdsParser {
@@ -44,7 +41,6 @@ impl Default for ReplicaCmdsParser {
             proposer_cache: proposer_cache(),
             starting_block: None,
             line_count: 0,
-            merger: BlockMerger::global(),
         }
     }
 }
@@ -105,6 +101,7 @@ struct Resps {
 }
 
 #[derive(Debug, Deserialize)]
+#[allow(dead_code)]
 struct ResponseBundle(
     #[serde(deserialize_with = "deserialize_option_string")] Option<String>,
     Vec<ActionResponse>,
@@ -161,8 +158,7 @@ impl crate::parsers::Parser for ReplicaCmdsParser {
                 "ReplicaCmdsParser buffer size limit exceeded"
             );
             bail!(
-                "ReplicaCmdsParser buffer exceeded {} bytes",
-                MAX_BUFFER_SIZE
+                "ReplicaCmdsParser buffer exceeded {MAX_BUFFER_SIZE} bytes"
             );
         }
 
@@ -329,11 +325,11 @@ impl ReplicaCmdsParser {
 
         records.reserve(action_count);
 
-        let mut actions = ActionIter::new(signed_action_bundles);
+        let actions = ActionIter::new(signed_action_bundles);
         let mut responses = ResponseIter::new(resps);
         let topic = TRANSACTIONS_TOPIC.to_string();
 
-        while let Some(signed_action) = actions.next() {
+        for signed_action in actions {
             let ActionResponse { user, res } = responses.next().unwrap_or_default();
             let tx = TransactionRecord {
                 time: timestamp,
