@@ -1,26 +1,14 @@
 use anyhow::{anyhow, Context, Result};
-use lru::LruCache;
-use parking_lot::RwLock;
 use redis::aio::ConnectionManager;
 use redis::AsyncCommands;
+use serde::Deserialize;
 use sonic_rs::{JsonContainerTrait, JsonValueTrait, Value};
-use std::num::NonZeroUsize;
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, OnceLock};
 use tokio::sync::Mutex as AsyncMutex;
-use tracing::{debug, info, warn};
-
-pub const DEFAULT_HASH_STORE_CACHE_SIZE: usize = 20_000;
+use tokio::time::{sleep, Duration};
+use tracing::{debug, warn};
 
 static GLOBAL_HASH_STORE: OnceLock<Arc<HashStore>> = OnceLock::new();
-
-#[derive(Default)]
-pub struct HashStoreStats {
-    cache_hits: AtomicU64,
-    cache_misses: AtomicU64,
-    redis_hits: AtomicU64,
-    redis_misses: AtomicU64,
-}
 
 #[derive(Clone, Debug)]
 pub struct RedisBlockData {
@@ -30,58 +18,62 @@ pub struct RedisBlockData {
 }
 
 pub enum BlockLookupResult {
-    /// Served from the in-memory cache.
-    CacheHit(RedisBlockData),
-    /// Served from Redis and cached.
+    /// Served from Redis.
     RedisHit(RedisBlockData),
-    /// Cache miss with no Redis access (cache-only mode).
-    CacheOnlyMiss,
-    /// Cache miss and Redis did not have usable data.
-    RedisMiss,
+    /// Served from Explorer API fallback.
+    ExplorerHit(RedisBlockData),
+    /// Both Redis and Explorer failed.
+    Miss,
 }
 
 impl BlockLookupResult {
     pub fn metric_label(&self) -> &'static str {
         match self {
-            BlockLookupResult::CacheHit(_) => "lookup.cache_hit",
             BlockLookupResult::RedisHit(_) => "lookup.redis_hit",
-            BlockLookupResult::CacheOnlyMiss => "lookup.cache_only_miss",
-            BlockLookupResult::RedisMiss => "lookup.redis_miss",
+            BlockLookupResult::ExplorerHit(_) => "lookup.explorer_hit",
+            BlockLookupResult::Miss => "lookup.miss",
         }
     }
 }
 
+#[derive(serde::Serialize)]
+struct ExplorerBlockRequest {
+    #[serde(rename = "type")]
+    request_type: String,
+    #[serde(rename = "blockNumber")]
+    block_number: u64,
+}
+
+#[derive(Deserialize, Debug)]
+struct ExplorerBlockResponse {
+    hash: Option<String>,
+    #[serde(rename = "blockTime")]
+    block_time: Option<u64>,
+    proposer: Option<String>,
+}
+
+const EXPLORER_API_URL: &str = "https://api.hyperliquid.xyz/info";
+const EXPLORER_REQUEST_TYPE: &str = "blockDetails";
+const EXPLORER_RETRY_DELAYS_MS: [u64; 3] = [500, 1000, 2000];
+
 pub struct HashStore {
-    /// LRU cache for hot hashes
-    cache: RwLock<LruCache<u64, RedisBlockData>>,
     /// Redis connection used for lookups
-    redis_conn: Option<AsyncMutex<ConnectionManager>>,
-    /// Whether to skip Redis lookups entirely (used when no data source exists)
-    cache_only_mode: bool,
-    /// Metrics
-    stats: HashStoreStats,
+    redis_conn: AsyncMutex<ConnectionManager>,
+    /// HTTP client for Explorer API fallback
+    explorer_client: reqwest::Client,
 }
 
 impl HashStore {
-    pub async fn new(redis_url: &str, cache_size: usize, cache_only_mode: bool) -> Result<Self> {
-        let cache_size = cache_size.max(1);
-        let cache = LruCache::new(
-            NonZeroUsize::new(cache_size).expect("nonzero cache size required for LruCache"),
-        );
-
-        let redis_conn = if cache_only_mode {
-            None
-        } else {
-            Some(AsyncMutex::new(
-                Self::create_connection_manager(redis_url).await?,
-            ))
-        };
+    pub async fn new(redis_url: &str) -> Result<Self> {
+        let redis_conn = Self::create_connection_manager(redis_url).await?;
+        let explorer_client = reqwest::Client::builder()
+            .timeout(Duration::from_secs(5))
+            .build()
+            .context("failed to create Explorer API client")?;
 
         Ok(Self {
-            cache: RwLock::new(cache),
-            redis_conn,
-            cache_only_mode,
-            stats: HashStoreStats::default(),
+            redis_conn: AsyncMutex::new(redis_conn),
+            explorer_client,
         })
     }
 
@@ -95,59 +87,35 @@ impl HashStore {
             .context("failed to establish Redis connection")
     }
 
-    pub async fn init(
-        redis_url: &str,
-        cache_size: usize,
-        cache_only_mode: bool,
-    ) -> Result<Arc<HashStore>> {
-        let store = Arc::new(Self::new(redis_url, cache_size, cache_only_mode).await?);
+    pub async fn init(redis_url: &str) -> Result<Arc<HashStore>> {
+        let store = Arc::new(Self::new(redis_url).await?);
         GLOBAL_HASH_STORE
             .set(store.clone())
             .map_err(|_| anyhow!("hash store already initialized"))?;
         Ok(store)
     }
 
-    /// Retrieve block data from cache or Redis.
-    ///
-    /// When cache_only_mode is true, only the LRU cache is checked.
+    /// Retrieve block data from Redis, falling back to Explorer API if needed.
     pub async fn get_block_data(&self, height: u64) -> BlockLookupResult {
-        if let Some(data) = self.get_from_cache(height) {
-            self.stats.cache_hits.fetch_add(1, Ordering::Relaxed);
-            return BlockLookupResult::CacheHit(data);
-        }
-        self.stats.cache_misses.fetch_add(1, Ordering::Relaxed);
-
-        if self.cache_only_mode {
-            return BlockLookupResult::CacheOnlyMiss;
+        // Try Redis first
+        if let Some(data) = self.fetch_from_redis(height).await {
+            return BlockLookupResult::RedisHit(data);
         }
 
-        match self.fetch_from_redis(height).await {
-            Some(data) => {
-                self.stats.redis_hits.fetch_add(1, Ordering::Relaxed);
-                let mut cache = self.cache.write();
-                cache.put(height, data.clone());
-                BlockLookupResult::RedisHit(data)
+        // Fallback to Explorer API
+        if let Some(data) = self.fetch_from_explorer(height).await {
+            // Store in Redis for future lookups
+            if let Err(err) = self.set_block_data(height, &data).await {
+                warn!(height, %err, "Failed to cache Explorer data in Redis");
             }
-            None => {
-                self.stats.redis_misses.fetch_add(1, Ordering::Relaxed);
-                BlockLookupResult::RedisMiss
-            }
+            return BlockLookupResult::ExplorerHit(data);
         }
+
+        BlockLookupResult::Miss
     }
 
-    /// Store block data in Redis and cache.
-    /// This is used when Explorer API fallback provides new block data.
+    /// Store block data in Redis (called when Explorer API provides new data).
     pub async fn set_block_data(&self, height: u64, data: &RedisBlockData) -> Result<()> {
-        if self.cache_only_mode {
-            self.cache.write().put(height, data.clone());
-            return Ok(());
-        }
-
-        let conn_mutex = self
-            .redis_conn
-            .as_ref()
-            .ok_or_else(|| anyhow!("Redis connection not available"))?;
-
         let key = format!("block:{height}");
         let payload = sonic_rs::to_string(&serde_json::json!({
             "hash": data.hash,
@@ -156,12 +124,11 @@ impl HashStore {
         }))
         .context("failed to serialize block data")?;
 
-        let mut conn = conn_mutex.lock().await;
+        let mut conn = self.redis_conn.lock().await;
         conn.set::<_, _, ()>(&key, payload)
             .await
             .with_context(|| format!("failed to write block data to Redis for height {height}"))?;
 
-        self.cache.write().put(height, data.clone());
         Ok(())
     }
 
@@ -172,36 +139,9 @@ impl HashStore {
             .clone()
     }
 
-    /// Log current counters for observability.
-    pub fn log_stats(&self) {
-        info!(
-            cache_hits = self.stats.cache_hits.load(Ordering::Relaxed),
-            cache_misses = self.stats.cache_misses.load(Ordering::Relaxed),
-            redis_hits = self.stats.redis_hits.load(Ordering::Relaxed),
-            redis_misses = self.stats.redis_misses.load(Ordering::Relaxed),
-            cache_entries = self.cache_len(),
-            "HashStore stats"
-        );
-    }
-
-    /// Public helper for monitoring the in-memory cache.
-    pub fn cache_len(&self) -> usize {
-        self.cache.read().len()
-    }
-
-    fn get_from_cache(&self, height: u64) -> Option<RedisBlockData> {
-        let mut cache = self.cache.write();
-        cache.get(&height).cloned()
-    }
-
     async fn fetch_from_redis(&self, height: u64) -> Option<RedisBlockData> {
-        let conn_mutex = match self.redis_conn.as_ref() {
-            Some(conn) => conn,
-            None => return None,
-        };
-
         let key = format!("block:{height}");
-        let mut conn = conn_mutex.lock().await;
+        let mut conn = self.redis_conn.lock().await;
         let result: redis::RedisResult<Option<String>> = conn.get(&key).await;
 
         match result {
@@ -253,10 +193,77 @@ impl HashStore {
         }
     }
 
-    #[cfg(test)]
-    pub fn cache_insert_for_test(&self, height: u64, data: RedisBlockData) {
-        let mut cache = self.cache.write();
-        cache.put(height, data);
+    /// Fetch block details from Explorer API with exponential backoff retry.
+    async fn fetch_from_explorer(&self, height: u64) -> Option<RedisBlockData> {
+        for (attempt, delay_ms) in EXPLORER_RETRY_DELAYS_MS.iter().enumerate() {
+            let request_body = ExplorerBlockRequest {
+                request_type: EXPLORER_REQUEST_TYPE.to_string(),
+                block_number: height,
+            };
+
+            let response = self
+                .explorer_client
+                .post(EXPLORER_API_URL)
+                .json(&request_body)
+                .send()
+                .await;
+
+            let parsed = match response {
+                Ok(resp) if resp.status().is_success() => {
+                    match resp.json::<ExplorerBlockResponse>().await {
+                        Ok(explorer_data) => Some(explorer_data),
+                        Err(err) => {
+                            warn!(height, attempt = attempt + 1, %err, "Failed to parse Explorer API response");
+                            None
+                        }
+                    }
+                }
+                Ok(resp) => {
+                    warn!(
+                        height,
+                        attempt = attempt + 1,
+                        status = %resp.status(),
+                        "Explorer API returned error status"
+                    );
+                    None
+                }
+                Err(err) => {
+                    warn!(height, attempt = attempt + 1, %err, "Explorer API request failed");
+                    None
+                }
+            };
+
+            if let Some(explorer_data) = parsed {
+                if let (Some(hash), Some(block_time), Some(proposer)) = (
+                    explorer_data.hash,
+                    explorer_data.block_time,
+                    explorer_data.proposer,
+                ) {
+                    return Some(RedisBlockData {
+                        block_time,
+                        proposer,
+                        hash,
+                    });
+                }
+
+                warn!(
+                    height,
+                    attempt = attempt + 1,
+                    "Explorer API response missing required fields"
+                );
+            }
+
+            if attempt + 1 < EXPLORER_RETRY_DELAYS_MS.len() {
+                sleep(Duration::from_millis(*delay_ms)).await;
+            }
+        }
+
+        warn!(
+            height,
+            attempts = EXPLORER_RETRY_DELAYS_MS.len(),
+            "Explorer API fallback failed after all retries"
+        );
+        None
     }
 }
 

@@ -1,22 +1,36 @@
 use crate::metrics::LATEST_BLOCK_HEIGHT;
 use crate::parsers::block_merger::{BlockMerger, ReplicaBlockData};
-use crate::parsers::blocks::{proposer_cache, SharedProposerCache};
-use crate::parsers::utils::{deserialize_option_string, extract_starting_block};
+use crate::parsers::utils::extract_starting_block;
 use crate::parsers::{
     drain_complete_lines, line_preview, parse_iso8601_to_millis, trim_line_bytes,
     LINE_PREVIEW_LIMIT,
 };
 use crate::sorter_client::proto::DataRecord;
 use anyhow::{bail, Context, Result};
+use dashmap::DashMap;
+use serde::de::IgnoredAny;
 use serde::{Deserialize, Serialize};
 use sonic_rs::{JsonContainerTrait, JsonValueTrait, Value};
+use std::borrow::Cow;
 use std::path::Path;
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 use tracing::warn;
 
 /// Maximum buffer size before refusing to accept more data (32 MiB).
 const MAX_BUFFER_SIZE: usize = 32 * 1024 * 1024;
 const TRANSACTIONS_TOPIC: &str = "hl.transactions";
+
+/// Shared cache for block proposers, keyed by block height.
+pub type SharedProposerCache = Arc<DashMap<u64, String>>;
+
+static GLOBAL_PROPOSER_CACHE: OnceLock<SharedProposerCache> = OnceLock::new();
+
+/// Get or initialize the global proposer cache.
+pub fn proposer_cache() -> SharedProposerCache {
+    GLOBAL_PROPOSER_CACHE
+        .get_or_init(|| Arc::new(DashMap::new()))
+        .clone()
+}
 
 /// Combined parser for `replica_cmds` files that generates both blocks and transactions.
 ///
@@ -51,42 +65,37 @@ impl Default for ReplicaCmdsParser {
 
 /// Unified structure that contains both block metadata and transaction data
 #[derive(Debug, Deserialize)]
-struct ReplicaCmd {
-    #[serde(default)]
-    abci_block: Option<AbciBlock>,
-    #[serde(default)]
-    resps: Option<Resps>,
+struct ReplicaCmd<'a> {
+    #[serde(default, borrow)]
+    abci_block: Option<AbciBlock<'a>>,
+    #[serde(default, borrow)]
+    resps: Option<Resps<'a>>,
 }
 
 #[derive(Debug, Deserialize, Default)]
-struct AbciBlock {
+struct AbciBlock<'a> {
     #[serde(default)]
     round: u64,
-    #[serde(default, deserialize_with = "deserialize_option_string")]
-    proposer: Option<String>,
-    #[serde(default, deserialize_with = "deserialize_option_string")]
-    time: Option<String>,
+    #[serde(default, borrow)]
+    proposer: Option<Cow<'a, str>>,
+    #[serde(default, borrow)]
+    time: Option<Cow<'a, str>>,
     #[serde(default)]
     signed_action_bundles: Vec<BundleWithHash>,
 }
 
 #[derive(Debug, Deserialize)]
 struct BundlePayload {
-    #[serde(
-        default,
-        rename = "broadcaster",
-        deserialize_with = "deserialize_option_string"
-    )]
-    _broadcaster: Option<String>,
+    #[serde(default, skip_deserializing)]
+    _broadcaster: Option<IgnoredAny>,
     #[serde(default)]
     signed_actions: Vec<SignedAction>,
 }
 
 #[derive(Debug, Deserialize)]
 struct BundleWithHash(
-    #[allow(dead_code)] // retained for schema compatibility even though hashes are dropped
-    #[serde(deserialize_with = "deserialize_option_string")]
-    Option<String>,
+    #[allow(dead_code)]
+    IgnoredAny,
     BundlePayload,
 );
 
@@ -94,35 +103,36 @@ struct BundleWithHash(
 struct SignedAction {
     #[serde(default)]
     action: Value,
-    #[serde(default, rename = "nonce")]
+    #[serde(default, rename = "nonce", skip_deserializing)]
     _nonce: u64,
 }
 
 #[derive(Debug, Deserialize, Default)]
-struct Resps {
-    #[serde(rename = "Full", default)]
-    full: Vec<ResponseBundle>,
+struct Resps<'a> {
+    #[serde(rename = "Full", default, borrow)]
+    full: Vec<ResponseBundle<'a>>,
 }
 
 #[derive(Debug, Deserialize)]
 #[allow(dead_code)]
-struct ResponseBundle(
-    #[serde(deserialize_with = "deserialize_option_string")] Option<String>,
-    Vec<ActionResponse>,
+struct ResponseBundle<'a>(
+    IgnoredAny,
+    #[serde(borrow)]
+    Vec<ActionResponse<'a>>,
 );
 
 #[derive(Debug, Deserialize, Default)]
-struct ActionResponse {
-    #[serde(default, deserialize_with = "deserialize_option_string")]
-    user: Option<String>,
+struct ActionResponse<'a> {
+    #[serde(default, borrow)]
+    user: Option<Cow<'a, str>>,
     #[serde(default)]
-    res: ResponseResult,
+    res: ResponseResult<'a>,
 }
 
 #[derive(Debug, Deserialize, Default)]
-struct ResponseResult {
-    #[serde(default, deserialize_with = "deserialize_option_string")]
-    status: Option<String>,
+struct ResponseResult<'a> {
+    #[serde(default, borrow)]
+    status: Option<Cow<'a, str>>,
     #[serde(default)]
     response: Value,
 }
@@ -187,7 +197,7 @@ impl crate::parsers::Parser for ReplicaCmdsParser {
             let calculated_height = self.starting_block.map(|start| start + self.line_count + 1);
 
             // Parse JSON once and process both blocks and transactions
-            match sonic_rs::from_slice::<ReplicaCmd>(&line) {
+            match sonic_rs::from_slice::<ReplicaCmd<'_>>(&line) {
                 Ok(cmd) => {
                     // Process the parsed command - this will generate both blocks and transactions
                     self.process_replica_cmd(cmd, calculated_height, &mut records)?;
@@ -230,7 +240,7 @@ impl ReplicaCmdsParser {
     /// This is the key optimization: we parse JSON once and extract both types of data.
     fn process_replica_cmd(
         &self,
-        cmd: ReplicaCmd,
+        cmd: ReplicaCmd<'_>,
         calculated_height: Option<u64>,
         records: &mut Vec<DataRecord>,
     ) -> Result<()> {
@@ -256,7 +266,7 @@ impl ReplicaCmdsParser {
         let block_height = calculated_height.unwrap_or(round);
 
         // Parse timestamp once - warn on failure to maintain parity with BlocksParser
-        let timestamp = match time.as_deref() {
+        let timestamp = match normalize_opt_str(time).as_deref() {
             Some(time_str) if !time_str.trim().is_empty() => {
                 parse_iso8601_to_millis(time_str).unwrap_or_else(|| {
                     warn!(time = %time_str, height = block_height, "failed to parse abci_block time");
@@ -267,7 +277,9 @@ impl ReplicaCmdsParser {
         };
 
         // Cache proposer for future use
-        let proposer_str = proposer.unwrap_or_default();
+        let proposer_str = normalize_opt_str(proposer)
+            .map(|v| v.to_string())
+            .unwrap_or_default();
         if !proposer_str.is_empty() {
             self.proposer_cache
                 .insert(block_height, proposer_str.clone());
@@ -337,9 +349,12 @@ impl ReplicaCmdsParser {
 
         for signed_action in actions {
             let ActionResponse { user, res } = responses.next().unwrap_or_default();
+            let user = normalize_opt_str(user)
+                .map(|v| v.to_string())
+                .unwrap_or_default();
             let tx = TransactionRecord {
                 time: timestamp,
-                user: user.unwrap_or_default(),
+                user,
                 hash: String::new(), // Hash not available for transactions
                 action: signed_action.action,
                 block: block_height,
@@ -399,13 +414,13 @@ impl Iterator for ActionIter {
     }
 }
 
-struct ResponseIter {
-    bundles: std::vec::IntoIter<ResponseBundle>,
-    current: Option<std::vec::IntoIter<ActionResponse>>,
+struct ResponseIter<'a> {
+    bundles: std::vec::IntoIter<ResponseBundle<'a>>,
+    current: Option<std::vec::IntoIter<ActionResponse<'a>>>,
 }
 
-impl ResponseIter {
-    fn new(resps: Option<Resps>) -> Self {
+impl<'a> ResponseIter<'a> {
+    fn new(resps: Option<Resps<'a>>) -> Self {
         let bundles = resps
             .map(|resps| resps.full.into_iter())
             .unwrap_or_else(|| Vec::new().into_iter());
@@ -417,8 +432,8 @@ impl ResponseIter {
     }
 }
 
-impl Iterator for ResponseIter {
-    type Item = ActionResponse;
+impl<'a> Iterator for ResponseIter<'a> {
+    type Item = ActionResponse<'a>;
 
     fn next(&mut self) -> Option<Self::Item> {
         loop {
@@ -434,12 +449,30 @@ impl Iterator for ResponseIter {
     }
 }
 
-fn parse_error(res: &ResponseResult) -> Option<String> {
+fn normalize_opt_str(value: Option<Cow<'_, str>>) -> Option<Cow<'_, str>> {
+    value.and_then(|v| {
+        let trimmed = v.trim();
+        if trimmed.is_empty() {
+            None
+        } else if trimmed.len() == v.len() {
+            Some(v)
+        } else {
+            Some(Cow::Owned(trimmed.to_string()))
+        }
+    })
+}
+
+fn parse_error(res: &ResponseResult<'_>) -> Option<String> {
     const DATA_KEY: &str = "data";
     const STATUSES_KEY: &str = "statuses";
     const ERROR_KEY: &str = "error";
 
-    match res.status.as_deref() {
+    match res
+        .status
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+    {
         Some("err") => res.response.as_str().map(|msg| msg.to_string()),
         Some("ok") => {
             let statuses = res.response.get(DATA_KEY)?.get(STATUSES_KEY)?.as_array()?;
@@ -470,7 +503,7 @@ mod tests {
     #[test]
     fn parse_error_from_err_status() {
         let res = ResponseResult {
-            status: Some("err".to_string()),
+            status: Some("err".to_string().into()),
             response: sonic_rs::json!("Invalid nonce: duplicate nonce 1764221206959"),
         };
         assert_eq!(
@@ -482,7 +515,7 @@ mod tests {
     #[test]
     fn parse_error_from_ok_status_with_nested_error() {
         let res = ResponseResult {
-            status: Some("ok".to_string()),
+            status: Some("ok".to_string().into()),
             response: sonic_rs::json!({
                 "type": "order",
                 "data": {
@@ -504,7 +537,7 @@ mod tests {
     #[test]
     fn parse_error_from_ok_status_success() {
         let res = ResponseResult {
-            status: Some("ok".to_string()),
+            status: Some("ok".to_string().into()),
             response: sonic_rs::json!({
                 "type": "order",
                 "data": {

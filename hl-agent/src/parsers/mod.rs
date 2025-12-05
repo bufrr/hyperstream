@@ -3,7 +3,6 @@ use anyhow::{anyhow, Result};
 use std::path::Path;
 
 pub mod block_merger;
-pub mod blocks;
 pub mod buffered;
 pub mod fills;
 pub mod hash_store;

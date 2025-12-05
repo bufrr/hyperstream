@@ -3,19 +3,10 @@
 //! This agent reads blockchain data from local files,
 //! parses it into standardized formats, and forwards to downstream systems.
 
-mod checkpoint;
-mod config;
-mod metrics;
-mod output_writer;
-mod parsers;
-mod runner;
-mod sorter_client;
-mod tailer;
-mod watcher;
-
 use anyhow::{Context, Result};
-use config::Config;
-use parsers::hash_store::{HashStore, DEFAULT_HASH_STORE_CACHE_SIZE};
+use hl_agent::config::Config;
+use hl_agent::parsers::hash_store::HashStore;
+use hl_agent::runner;
 use std::net::SocketAddr;
 use tracing::info;
 
@@ -39,7 +30,7 @@ async fn main() -> Result<()> {
 async fn init_hash_store(config: &Config) -> Result<()> {
     let redis_url = config.redis_url();
 
-    HashStore::init(&redis_url, DEFAULT_HASH_STORE_CACHE_SIZE, false)
+    HashStore::init(&redis_url)
         .await
         .context("failed to initialize hash store")?;
 

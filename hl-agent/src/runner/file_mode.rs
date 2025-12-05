@@ -4,8 +4,6 @@
 
 use crate::checkpoint::CheckpointDB;
 use crate::config::Config;
-use crate::parsers::block_merger::BlockMerger;
-use crate::parsers::hash_store::HashStore;
 use crate::parsers::route_parser;
 use crate::runner::{build_record_sink, resolve_batch_size};
 use crate::tailer::{tail_file, TailerConfig};
@@ -311,10 +309,6 @@ impl FileRunner {
         self.drain_tailers(shutdown_timeout).await;
         self.stop_activity_monitor(shutdown_timeout).await;
         self.stop_watcher(shutdown_timeout).await;
-
-        // Log final merger statistics
-        BlockMerger::global().log_stats();
-        HashStore::global().log_stats();
 
         Ok(())
     }

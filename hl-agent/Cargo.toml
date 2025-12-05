@@ -9,7 +9,7 @@ path = "src/lib.rs"
 
 [[bin]]
 name = "hl-agent"
-path = "src/main.rs"
+path = "src/bin/hl_agent.rs"
 
 [[bin]]
 name = "ws-agent"
